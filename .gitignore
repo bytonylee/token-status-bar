@@ -1,0 +1,29 @@
+# ─── Runtime data (machine-local, contains account state) ─────────────
+# All secrets / local runtime data live in secrets/ (db, status.json, logs)
+secrets/
+*.log
+
+# ─── Build artifacts ──────────────────────────────────────────────────
+build/
+TokenStatusBar.app/
+MenuBarAgent.app/
+*.dmg
+
+# ─── Python ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ─── Swift / Xcode ────────────────────────────────────────────────────
+.build/
+*.swiftmodule
+
+# ─── macOS ────────────────────────────────────────────────────────────
+.DS_Store
+
+# ─── Personal files (account data, never commit) ─────────────────────
+reset_coupon.md
+reset_coupon*.md
+secrets/

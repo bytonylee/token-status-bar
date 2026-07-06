@@ -34,6 +34,7 @@ struct Account: Codable, Identifiable {
     var monthly_used: Double?
     var monthly_limit: Double?
     var monthly_used_pct: Double?
+    var monthly_period_start: String?
     var monthly_period_end: String?
     var reset_credits: [ResetCredit]?
     var last_poll: String?
@@ -1199,6 +1200,22 @@ extension AppDelegate: NSMenuDelegate {
         return "\(t("plan")): \(plan)"
     }
 
+    func planStartText(_ acct: Account) -> String? {
+        let start = acct.plan_start ?? acct.billing_period_start ?? acct.monthly_period_start
+        if let start, !start.isEmpty {
+            return L10n.label("plan_started", start)
+        }
+        return nil
+    }
+
+    func planResetText(_ acct: Account) -> String? {
+        let end = acct.plan_reset ?? acct.monthly_period_end
+        if let end, !end.isEmpty {
+            return L10n.label("plan_resets", end)
+        }
+        return nil
+    }
+
     /// Hours until the weekly (secondary) limit resets, when that reset is
     /// within the next 24h. Returns nil for providers whose secondary window
     /// is not a weekly limit (xai/copilot/antigravity), or when data is
@@ -1229,11 +1246,11 @@ extension AppDelegate: NSMenuDelegate {
         if let line = planText(acct) {
             submenu.addItem(infoItem(line, width: width))
         }
-        if let start = acct.plan_start, !start.isEmpty {
-            submenu.addItem(infoItem(L10n.label("plan_started", start), width: width))
+        if let start = planStartText(acct) {
+            submenu.addItem(infoItem(start, width: width))
         }
-        if let pr = acct.plan_reset, !pr.isEmpty {
-            submenu.addItem(infoItem(L10n.label("plan_resets", pr), width: width))
+        if let reset = planResetText(acct) {
+            submenu.addItem(infoItem(reset, width: width))
         }
         if let exp = acct.token_expires {
             submenu.addItem(infoItem(L10n.label("token_expires", exp), width: width))
@@ -1272,11 +1289,11 @@ extension AppDelegate: NSMenuDelegate {
         if let line = planText(acct) {
             submenu.addItem(infoItem(line, width: width))
         }
-        if let start = acct.plan_start, !start.isEmpty {
-            submenu.addItem(infoItem(L10n.label("plan_started", start), width: width))
+        if let start = planStartText(acct) {
+            submenu.addItem(infoItem(start, width: width))
         }
-        if let pr = acct.plan_reset, !pr.isEmpty {
-            submenu.addItem(infoItem(L10n.label("plan_resets", pr), width: width))
+        if let reset = planResetText(acct) {
+            submenu.addItem(infoItem(reset, width: width))
         }
         if let exp = acct.token_expires {
             submenu.addItem(infoItem(L10n.label("token_expires", exp), width: width))
@@ -1294,11 +1311,11 @@ extension AppDelegate: NSMenuDelegate {
         if let line = planText(acct) {
             submenu.addItem(infoItem(line, width: width))
         }
-        if let start = acct.plan_start, !start.isEmpty {
-            submenu.addItem(infoItem(L10n.label("plan_started", start), width: width))
+        if let start = planStartText(acct) {
+            submenu.addItem(infoItem(start, width: width))
         }
-        if let pr = acct.plan_reset, !pr.isEmpty {
-            submenu.addItem(infoItem(L10n.label("plan_resets", pr), width: width))
+        if let reset = planResetText(acct) {
+            submenu.addItem(infoItem(reset, width: width))
         }
         if let exp = acct.token_expires {
             submenu.addItem(infoItem(L10n.label("token_expires", exp), width: width))
@@ -1374,6 +1391,12 @@ extension AppDelegate: NSMenuDelegate {
         if let plan = normalizePlan(acct), !plan.isEmpty {
             lines.append(L10n.label("plan", plan))
         }
+        if let start = planStartText(acct) {
+            lines.append(start)
+        }
+        if let reset = planResetText(acct) {
+            lines.append(reset)
+        }
         if let msg = acct.status_message, !msg.isEmpty {
             lines.append(L10n.label("status", msg))
         }
@@ -1419,12 +1442,6 @@ extension AppDelegate: NSMenuDelegate {
             }
             if let r = acct.limited_user_reset_date {
                 lines.append(L10n.label("quota_reset", r))
-            }
-        }
-        // Devin-specific: plan reset date
-        if acct.provider == "devin" {
-            if let pr = acct.plan_reset {
-                lines.append(L10n.label("plan_resets", pr))
             }
         }
         // Grok-specific: monthly credits

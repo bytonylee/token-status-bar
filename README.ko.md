@@ -66,6 +66,17 @@
 | GitHub Copilot     | `copilot`     | OAuth (디바이스 플로우) |
 | Devin              | `devin`       | API 키           |
 
+### 현재 상태 표시 범위
+
+| 제공자 | 사용량 / 쿼터 상태 | 구독 기간 상태 |
+|--------|--------------------|----------------|
+| OpenAI Codex | 요금제, 5시간 / 주간 사용량, 리셋 크레딧 | 현재 인증된 `wham/usage` 응답에서 제공되지 않음 |
+| Anthropic Claude | 요금제, 5시간 / 주간 사용량 | 구독 시작일만 제공(`subscription_created_at`) |
+| xAI / Grok | 월간 크레딧, 일일 요청/토큰 제한 | billing API에서 시작일과 종료일 제공 |
+| Google Antigravity | 티어와 모델 쿼터 | 현재 Code Assist 엔드포인트에서 제공되지 않음 |
+| GitHub Copilot | 프리미엄/채팅 쿼터와 월간 리셋 | 리셋/종료일만 제공(`quota_reset_date`) |
+| Devin | 일일/주간 쿼터와 크레딧 잔액 | `GetUserStatus`에서 시작일과 종료일 제공 |
+
 ## 동작 방식
 
 두 개의 파이프라인이 있습니다. **온보딩**(OAuth로 계정 연결)은 토큰을

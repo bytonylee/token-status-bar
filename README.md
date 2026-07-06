@@ -70,6 +70,17 @@ real API exists.**
 | GitHub Copilot    | `copilot`     | OAuth (device flow) |
 | Devin             | `devin`       | API key       |
 
+### Current status coverage
+
+| Provider | Usage / quota status | Subscription period status |
+|----------|----------------------|----------------------------|
+| OpenAI Codex | Plan, 5h / weekly usage, reset credits | Not exposed by the current authenticated `wham/usage` response |
+| Anthropic Claude | Plan, 5h / weekly usage | Subscription start only (`subscription_created_at`) |
+| xAI / Grok | Monthly credits, daily request/token limits | Start and end exposed by the billing API |
+| Google Antigravity | Tier and model quota | Not exposed by the current Code Assist endpoints |
+| GitHub Copilot | Premium/chat quota and monthly reset | Reset/end only (`quota_reset_date`) |
+| Devin | Daily/weekly quota and credit balance | Start and end exposed by `GetUserStatus` |
+
 ## How it works
 
 Two pipelines: **onboarding** (connect an account over OAuth) writes tokens to

@@ -23,7 +23,7 @@ os.environ["AGENT_POOL_DB"] = str(Path(_TMP) / "pool.db")
 os.environ["AGENT_POOL_STATUS_JSON"] = str(Path(_TMP) / "status.json")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import store, oauth, poller, pool  # noqa: E402
+import store, oauth, poller, pool, status  # noqa: E402
 
 
 # ─── fake HTTP ──────────────────────────────────────────────────────────────
@@ -105,9 +105,8 @@ def _fake_urlopen(req, timeout=None):
     # ── antigravity ──
     if "loadCodeAssist" in url:
         return _FakeResp(200, {
-            "currentTier": {"id": "free-tier", "name": "Free"},
-            "paidTier": {"id": "g1-pro-tier", "name": "Google AI Pro",
-                         "description": "Pro tier"},
+            "allowedTiers": [{"id": "standard-tier", "name": "Antigravity",
+                              "description": "Unlimited coding assistant"}],
             "cloudaicompanionProject": "proj-123",
         }, {})
     if "fetchAvailableModels" in url:
@@ -265,6 +264,24 @@ class OnboardingPollTests(unittest.TestCase):
         for f in ("plan", "primary_used_pct", "primary_window_s",
                   "rate_limit_remaining", "rate_limit_limit"):
             self.assertIsNotNone(snap[f], f"antigravity snapshot missing {f}")
+        self.assertEqual(snap["plan"], "Antigravity")
+        rj = json.loads(snap["raw_json"])
+        self.assertEqual(rj["extra"]["tier_id"], "standard-tier")
+
+    def test_antigravity_plan_labels(self):
+        cases = [
+            ({"tier_id": "standard-tier"}, "Antigravity"),
+            ({"tier_id": "g1-plus-tier"}, "Google AI Plus"),
+            ({"tier_id": "g1-pro-tier"}, "Google AI Pro"),
+            ({"tier_id": "g1-ultra-tier"}, "Google AI Ultra"),
+            ({"tier_override": "plus"}, "Google AI Plus"),
+            ({"tier_override": "pro"}, "Google AI Pro"),
+            ({"tier_override": "ultra-20x"}, "Google AI Ultra 20x"),
+        ]
+        for item, expected in cases:
+            with self.subTest(item=item):
+                name, _ = status.plan_label("antigravity", "Antigravity", item)
+                self.assertEqual(name, expected)
 
     def test_copilot_subscription_data(self):
         _, snap = self._onboard("copilot")

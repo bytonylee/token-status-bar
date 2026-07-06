@@ -10,7 +10,7 @@ Limit sources:
 """
 from __future__ import annotations
 import json, os, sys, time, datetime, urllib.request, urllib.error
-import store, oauth
+import store, oauth, work_queue
 
 WHAM = "https://chatgpt.com/backend-api"
 POLL_INTERVAL = int(os.environ.get("AGENT_POOL_POLL_INTERVAL", "300"))  # 5 min
@@ -361,9 +361,12 @@ def poll_antigravity(conn, account, token):
             resp = json.loads(r.read())
             current = resp.get("currentTier", {})
             paid = resp.get("paidTier") or {}
+            allowed = resp.get("allowedTiers") or []
             # The session's active Code Assist tier is currentTier (often free-tier),
             # but the user's actual entitlement lives in paidTier. Prefer paidTier.
             tier = paid if paid.get("id") else current
+            if not tier.get("id") and allowed:
+                tier = allowed[0]
             plan = tier.get("name", "Gemini Code Assist")
             tier_id = tier.get("id")
             tier_desc = tier.get("description")
@@ -824,14 +827,18 @@ POLLERS = {
 
 
 def _refresh_if_needed(conn, account, token):
-    """Auto-refresh tokens that expire within 10 minutes."""
+    """Auto-refresh tokens that expire within 1 hour."""
     if not token or not token.get("refresh_token"):
         return token
     provider = account["provider"]
     if provider not in oauth.REFRESH_FUNCS:
         return token
-    if token.get("expires_at") and token["expires_at"] - time.time() < 600:
+    if token.get("expires_at") and token["expires_at"] - time.time() < 3600:
         try:
+            if provider == "antigravity":
+                client_id, client_secret = oauth._load_antigravity_creds()
+                oauth.ANTIGRAVITY["client_id"] = client_id
+                oauth.ANTIGRAVITY["client_secret"] = client_secret
             result = oauth.REFRESH_FUNCS[provider](token["refresh_token"])
             store.save_token(conn, account["id"], result["access_token"],
                              result.get("refresh_token"), result.get("id_token"),
@@ -877,34 +884,38 @@ def poll_account(conn, account) -> bool:
 
 
 def run_once(conn) -> int:
-    accounts = store.list_accounts(conn)
-    if not accounts:
-        print("(no accounts to poll)")
-        return 0
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Polling {len(accounts)} accounts...")
-    for a in accounts:
-        token = store.get_token(conn, a["id"])
-        if not token:
-            store.save_snapshot(conn, a["id"], {"status": "error", "status_message": "no token"})
-            continue
-        token = _refresh_if_needed(conn, a, token)
-        poller = POLLERS.get(a["provider"])
-        if not poller:
-            store.save_snapshot(conn, a["id"], {"status": "error", "status_message": f"no poller for {a['provider']}"})
-            continue
+    with work_queue.single_worker("poll") as acquired:
+        if not acquired:
+            print("poll already running; queued worker skipped")
+            return 0
+        accounts = store.list_accounts(conn)
+        if not accounts:
+            print("(no accounts to poll)")
+            return 0
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Polling {len(accounts)} accounts...")
+        for a in accounts:
+            token = store.get_token(conn, a["id"])
+            if not token:
+                store.save_snapshot(conn, a["id"], {"status": "error", "status_message": "no token"})
+                continue
+            token = _refresh_if_needed(conn, a, token)
+            poller = POLLERS.get(a["provider"])
+            if not poller:
+                store.save_snapshot(conn, a["id"], {"status": "error", "status_message": f"no poller for {a['provider']}"})
+                continue
+            try:
+                poller(conn, a, token)
+                print(f"  ✓ {a['provider']:12} {a['email'] or a['label']}")
+            except Exception as e:
+                store.save_snapshot(conn, a["id"], {"status": "error", "status_message": str(e)[:200]})
+                store.log_event(conn, a["id"], "limit_poll", False, str(e))
+                print(f"  ✗ {a['provider']:12} {a['email'] or a['label']}: {e}")
+        # Export status JSON for the menu bar app
         try:
-            poller(conn, a, token)
-            print(f"  ✓ {a['provider']:12} {a['email'] or a['label']}")
+            import status
+            status.cmd_export(conn)
         except Exception as e:
-            store.save_snapshot(conn, a["id"], {"status": "error", "status_message": str(e)[:200]})
-            store.log_event(conn, a["id"], "limit_poll", False, str(e))
-            print(f"  ✗ {a['provider']:12} {a['email'] or a['label']}: {e}")
-    # Export status JSON for the menu bar app
-    try:
-        import status
-        status.cmd_export(conn)
-    except Exception as e:
-        print(f"  export-status failed: {e}")
+            print(f"  export-status failed: {e}")
     return 0
 
 

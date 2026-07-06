@@ -21,7 +21,7 @@ Usage:
 from __future__ import annotations
 import json, os, sys, time, datetime
 from pathlib import Path
-import store, oauth
+import store, oauth, work_queue
 
 DB = store.connect()
 
@@ -141,6 +141,10 @@ def cmd_refresh(account_id):
         print(f"No refresh function for {provider}")
         return 1
     try:
+        if provider == "antigravity":
+            client_id, client_secret = oauth._load_antigravity_creds()
+            oauth.ANTIGRAVITY["client_id"] = client_id
+            oauth.ANTIGRAVITY["client_secret"] = client_secret
         result = oauth.REFRESH_FUNCS[provider](tok["refresh_token"])
         store.save_token(DB, int(account_id), result["access_token"],
                          result.get("refresh_token"), result.get("id_token"),
@@ -155,19 +159,28 @@ def cmd_refresh(account_id):
 
 
 def cmd_refresh_all():
-    accounts = store.list_accounts(DB)
-    refreshed = 0
-    for a in accounts:
-        tok = store.get_token(DB, a["id"])
-        if not tok or not tok["refresh_token"]:
-            continue
-        # Refresh if token expires within 1 hour
-        if tok["expires_at"] and tok["expires_at"] - time.time() < 3600:
-            print(f"Refreshing {a['provider']} / {a['email']}...")
+    with work_queue.single_worker("refresh") as acquired:
+        if not acquired:
+            print("refresh already running; queued worker skipped")
+            return 0
+        accounts = store.list_accounts(DB)
+        queue = []
+        for a in accounts:
+            tok = store.get_token(DB, a["id"])
+            if not tok or not tok["refresh_token"]:
+                continue
+            # Refresh if token expires within 1 hour.
+            if tok["expires_at"] and tok["expires_at"] - time.time() < 3600:
+                queue.append(a)
+        refreshed = 0
+        print(f"Queued {len(queue)} token refreshes.")
+        for i, a in enumerate(queue, start=1):
+            print(f"[{i}/{len(queue)}] Refreshing {a['provider']} / {a['email']}...")
             rc = cmd_refresh(str(a["id"]))
             if rc == 0:
                 refreshed += 1
-    print(f"\nRefreshed {refreshed} tokens.")
+            time.sleep(1)
+        print(f"\nRefreshed {refreshed} tokens.")
     return 0
 
 

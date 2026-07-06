@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.0.1-111111?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.0.2-111111?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/macOS-14%2B-111111?style=flat-square" alt="macOS 14+">
   <img src="https://img.shields.io/badge/Swift-menu%20bar-111111?style=flat-square" alt="Swift menu bar">
   <img src="https://img.shields.io/badge/Python-3.9%2B-111111?style=flat-square" alt="Python 3.9+">
@@ -69,6 +69,17 @@ real API exists.**
 | Google Antigravity| `antigravity` | OAuth (browser) |
 | GitHub Copilot    | `copilot`     | OAuth (device flow) |
 | Devin             | `devin`       | API key       |
+
+### Current status coverage
+
+| Provider | Usage / quota status | Subscription period status |
+|----------|----------------------|----------------------------|
+| OpenAI Codex | Plan, 5h / weekly usage, reset credits | Not exposed by the current authenticated `wham/usage` response |
+| Anthropic Claude | Plan, 5h / weekly usage | Subscription start only (`subscription_created_at`) |
+| xAI / Grok | Monthly credits, daily request/token limits | Start and end exposed by the billing API |
+| Google Antigravity | Tier and model quota | Not exposed by the current Code Assist endpoints |
+| GitHub Copilot | Premium/chat quota and monthly reset | Reset/end only (`quota_reset_date`) |
+| Devin | Daily/weekly quota and credit balance | Start and end exposed by `GetUserStatus` |
 
 ## How it works
 

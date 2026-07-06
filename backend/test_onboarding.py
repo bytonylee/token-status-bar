@@ -23,7 +23,7 @@ os.environ["AGENT_POOL_DB"] = str(Path(_TMP) / "pool.db")
 os.environ["AGENT_POOL_STATUS_JSON"] = str(Path(_TMP) / "status.json")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import store, oauth, poller, pool  # noqa: E402
+import store, oauth, poller, pool, status  # noqa: E402
 
 
 # ─── fake HTTP ──────────────────────────────────────────────────────────────
@@ -105,9 +105,8 @@ def _fake_urlopen(req, timeout=None):
     # ── antigravity ──
     if "loadCodeAssist" in url:
         return _FakeResp(200, {
-            "currentTier": {"id": "free-tier", "name": "Free"},
-            "paidTier": {"id": "g1-pro-tier", "name": "Google AI Pro",
-                         "description": "Pro tier"},
+            "allowedTiers": [{"id": "standard-tier", "name": "Antigravity",
+                              "description": "Unlimited coding assistant"}],
             "cloudaicompanionProject": "proj-123",
         }, {})
     if "fetchAvailableModels" in url:
@@ -151,7 +150,11 @@ def _fake_urlopen(req, timeout=None):
             return _varint((fn << 3) | 2) + _varint(len(data)) + data
         def _varint_field(fn, v):
             return _varint((fn << 3) | 0) + _varint(v)
-        quota = (_varint_field(14, 70) + _varint_field(15, 40)
+        plan_start = int(time.time()) - 30 * 86400
+        plan_reset = int(time.time()) + 86400
+        quota = (_bytes_field(2, _varint_field(1, plan_start))
+                 + _bytes_field(3, _varint_field(1, plan_reset))
+                 + _varint_field(14, 70) + _varint_field(15, 40)
                  + _varint_field(16, 5_000_000) + _varint_field(17, int(time.time()) + 86400)
                  + _varint_field(18, int(time.time()) + 604800))
         user_status = _bytes_field(7, b"test@example.com") + _bytes_field(13, quota)
@@ -250,9 +253,10 @@ class OnboardingPollTests(unittest.TestCase):
     def test_xai_subscription_data(self):
         _, snap = self._onboard("xai")
         for f in ("monthly_used", "monthly_limit", "monthly_used_pct",
-                  "monthly_period_end", "primary_used_pct", "primary_reset_at",
-                  "primary_window_s", "secondary_used_pct", "secondary_window_s",
-                  "rate_limit_remaining", "rate_limit_limit"):
+                  "monthly_period_start", "monthly_period_end",
+                  "primary_used_pct", "primary_reset_at", "primary_window_s",
+                  "secondary_used_pct", "secondary_window_s", "rate_limit_remaining",
+                  "rate_limit_limit"):
             self.assertIsNotNone(snap[f], f"xai snapshot missing {f}")
 
     def test_antigravity_subscription_data(self):
@@ -260,6 +264,24 @@ class OnboardingPollTests(unittest.TestCase):
         for f in ("plan", "primary_used_pct", "primary_window_s",
                   "rate_limit_remaining", "rate_limit_limit"):
             self.assertIsNotNone(snap[f], f"antigravity snapshot missing {f}")
+        self.assertEqual(snap["plan"], "Antigravity")
+        rj = json.loads(snap["raw_json"])
+        self.assertEqual(rj["extra"]["tier_id"], "standard-tier")
+
+    def test_antigravity_plan_labels(self):
+        cases = [
+            ({"tier_id": "standard-tier"}, "Antigravity"),
+            ({"tier_id": "g1-plus-tier"}, "Google AI Plus"),
+            ({"tier_id": "g1-pro-tier"}, "Google AI Pro"),
+            ({"tier_id": "g1-ultra-tier"}, "Google AI Ultra"),
+            ({"tier_override": "plus"}, "Google AI Plus"),
+            ({"tier_override": "pro"}, "Google AI Pro"),
+            ({"tier_override": "ultra-20x"}, "Google AI Ultra 20x"),
+        ]
+        for item, expected in cases:
+            with self.subTest(item=item):
+                name, _ = status.plan_label("antigravity", "Antigravity", item)
+                self.assertEqual(name, expected)
 
     def test_copilot_subscription_data(self):
         _, snap = self._onboard("copilot")
@@ -285,6 +307,28 @@ class OnboardingPollTests(unittest.TestCase):
             self.assertIsNotNone(snap[f], f"devin snapshot missing {f}")
         rj = json.loads(snap["raw_json"])
         self.assertEqual(rj["extra"]["credit_balance"], 5.0)
+        self.assertIsNotNone(rj["extra"].get("plan_start_unix"))
+        self.assertIsNotNone(rj["extra"].get("plan_reset_unix"))
+
+    def test_export_includes_billing_period_fields(self):
+        self._onboard("xai")
+        with mock.patch.object(oauth, "login_devin", return_value={
+            "access_token": "fake-devin-key", "refresh_token": None, "id_token": "",
+            "expires_at": 0, "account_id": "devin-org-1",
+            "email": "devin@example.com", "plan": "", "raw": {"api_key": "fake-devin-key"},
+        }):
+            self.assertEqual(pool.cmd_add_devin("fake-devin-key", "devin-test"), 0)
+
+        payload = json.loads(Path(os.environ["AGENT_POOL_STATUS_JSON"]).read_text())
+        by_provider = {a["provider"]: a for a in payload["accounts"]}
+        xai = by_provider["xai"]
+        self.assertEqual(xai["monthly_period_start"], "2026-01-01 09:00")
+        self.assertEqual(xai["monthly_period_end"], "2026-02-01 09:00")
+        self.assertEqual(xai["plan_start"], "2026-01-01 09:00")
+        self.assertEqual(xai["plan_reset"], "2026-02-01 09:00")
+        devin = by_provider["devin"]
+        self.assertIsNotNone(devin["plan_start"])
+        self.assertIsNotNone(devin["plan_reset"])
 
 
 if __name__ == "__main__":

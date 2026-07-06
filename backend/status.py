@@ -179,6 +179,12 @@ def claude_extra(snap) -> dict:
     if rl:
         out["primary_status"] = rl.get("anthropic-ratelimit-unified-5h-status")
         out["secondary_status"] = rl.get("anthropic-ratelimit-unified-7d-status")
+        fallback_pct = rl.get("anthropic-ratelimit-unified-fallback-percentage")
+        if fallback_pct is not None:
+            try:
+                out["fallback_used_pct"] = float(fallback_pct) * 100
+            except (TypeError, ValueError):
+                pass
         claim = rl.get("anthropic-ratelimit-unified-representative-claim")
         out["binding_window"] = {"five_hour": "5h", "seven_day": "weekly"}.get(claim, claim)
         out["overage_status"] = rl.get("anthropic-ratelimit-unified-overage-status")
@@ -251,10 +257,23 @@ def plan_label(provider, plan, item) -> tuple:
         return m.get(p.lower(), (p or None, None))
     if provider == "antigravity":
         tid = item.get("tier_id")
-        m = {"g1-pro-tier": ("Google AI Pro", "$19.99/mo"),
-             "g1-ultra-tier": ("Google AI Ultra", "$249.99/mo"),
+        override = (item.get("tier_override") or "").lower()
+        if override:
+            if "ultra" in override and "20" in override:
+                return ("Google AI Ultra 20x", None)
+            if "ultra" in override or "5x" in override:
+                return ("Google AI Ultra 5x", None)
+            if "pro" in override:
+                return ("Google AI Pro", None)
+            if "plus" in override:
+                return ("Google AI Plus", None)
+        m = {"g1-plus-tier": ("Google AI Plus", None),
+             "g1-pro-tier": ("Google AI Pro", "$19.99/mo"),
+             "g1-ultra-tier": ("Google AI Ultra", None),
+             "g1-ultra-5x-tier": ("Google AI Ultra 5x", None),
+             "g1-ultra-20x-tier": ("Google AI Ultra 20x", None),
              "free-tier": ("Free", "$0"),
-             "standard-tier": ("Standard", None)}
+             "standard-tier": ("Antigravity", None)}
         return m.get(tid, (p or None, None))
     if provider == "xai":
         return (p or None, None)

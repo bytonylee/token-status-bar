@@ -49,6 +49,7 @@ struct Account: Codable, Identifiable {
     var org_name: String?
     var primary_status: String?
     var secondary_status: String?
+    var fallback_used_pct: Double?
     var binding_window: String?
     var overage_status: String?
     // Grok / Antigravity / Copilot / Devin subscription details
@@ -288,6 +289,7 @@ final class FixedMenuRowView: NSView {
     private let dotColor: NSColor?
     private let accentNumbers: Bool
     private let accentPercent: Bool
+    private let warnPercent: Bool
     private let accentResetTime: Bool
     private let checkmark: Bool
     private let destructive: Bool
@@ -303,7 +305,7 @@ final class FixedMenuRowView: NSView {
 
     init(title: String, style: Style, action: (() -> Void)? = nil, submenu: NSMenu? = nil,
          dotColor: NSColor? = nil, accentNumbers: Bool = false, accentPercent: Bool = false,
-         accentResetTime: Bool = false,
+         warnPercent: Bool = false, accentResetTime: Bool = false,
          checkmark: Bool = false, badge: String? = nil, destructive: Bool = false,
          width: CGFloat = MenuRowLayout.width) {
         self.style = style
@@ -312,6 +314,7 @@ final class FixedMenuRowView: NSView {
         self.dotColor = dotColor
         self.accentNumbers = accentNumbers
         self.accentPercent = accentPercent
+        self.warnPercent = warnPercent
         self.accentResetTime = accentResetTime
         self.checkmark = checkmark
         self.destructive = destructive
@@ -389,7 +392,7 @@ final class FixedMenuRowView: NSView {
             let attr = NSMutableAttributedString(
                 string: rawTitle, attributes: [.font: label.font as Any, .foregroundColor: base])
             if let r = rawTitle.range(of: "[0-9]+(\\.[0-9]+)?%", options: .regularExpression) {
-                attr.addAttribute(.foregroundColor, value: NSColor.systemGreen,
+                attr.addAttribute(.foregroundColor, value: warnPercent ? NSColor.systemOrange : NSColor.systemGreen,
                                   range: NSRange(r, in: rawTitle))
             }
             if accentResetTime,
@@ -585,6 +588,7 @@ enum L10n {
             // ── Limit names ──
             "5h_limit": "5h limit",
             "weekly_limit": "weekly limit",
+            "fallback_limit": "fallback limit",
             "monthly_limit": "monthly limit",
             "daily_tokens": "daily tokens",
             "tier_usage": "tier usage",
@@ -677,6 +681,7 @@ enum L10n {
             // ── Limit names ──
             "5h_limit": "5시간 제한",
             "weekly_limit": "주간 제한",
+            "fallback_limit": "폴백 제한",
             "monthly_limit": "월간 제한",
             "daily_tokens": "일일 토큰",
             "tier_usage": "티어 사용량",
@@ -769,6 +774,7 @@ enum L10n {
             // ── Limit names ──
             "5h_limit": "5小时限制",
             "weekly_limit": "每周限制",
+            "fallback_limit": "回退限制",
             "monthly_limit": "每月限制",
             "daily_tokens": "每日令牌",
             "tier_usage": "层级用量",
@@ -861,6 +867,7 @@ enum L10n {
             // ── Limit names ──
             "5h_limit": "5時間制限",
             "weekly_limit": "週間制限",
+            "fallback_limit": "フォールバック制限",
             "monthly_limit": "月間制限",
             "daily_tokens": "日次トークン",
             "tier_usage": "ティア使用量",
@@ -1035,7 +1042,7 @@ extension AppDelegate: NSMenuDelegate {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.submenu = submenu
         item.view = FixedMenuRowView(title: title, style: .submenu, submenu: submenu,
-                                     dotColor: statusColor(acct.status), badge: weeklyBadge(acct))
+                                     dotColor: statusColor(acct.status), badge: endSoonBadge(acct))
         return item
     }
 
@@ -1071,6 +1078,13 @@ extension AppDelegate: NSMenuDelegate {
             }
             return acct.plan
         case "antigravity":
+            if override.contains("ultra") || override.contains("20x") || override.contains("5x") {
+                if override.contains("20x") || override.contains("20") { return "Ultra 20x" }
+                if override.contains("5x") || override.contains("5") { return "Ultra 5x" }
+                return "Ultra"
+            }
+            if override.contains("pro") { return "Pro" }
+            if override.contains("plus") { return "Plus" }
             if raw.contains("free") { return "Free" }
             if raw.contains("plus") { return "Plus" }
             if raw.contains("ultra") {
@@ -1216,14 +1230,8 @@ extension AppDelegate: NSMenuDelegate {
         return nil
     }
 
-    /// Hours until the weekly (secondary) limit resets, when that reset is
-    /// within the next 24h. Returns nil for providers whose secondary window
-    /// is not a weekly limit (xai/copilot/antigravity), or when data is
-    /// missing/stale.
-    func weeklyResetHoursLeft(_ acct: Account) -> Double? {
-        guard acct.provider == "codex" || acct.provider == "claude" || acct.provider == "devin" else { return nil }
-        guard acct.secondary_used_pct != nil,
-              let resetStr = acct.secondary_reset, !resetStr.isEmpty else { return nil }
+    func quotaResetHoursLeft(_ resetStr: String?) -> Double? {
+        guard let resetStr, !resetStr.isEmpty else { return nil }
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.timeZone = TimeZone(identifier: "Asia/Seoul")
@@ -1234,9 +1242,39 @@ extension AppDelegate: NSMenuDelegate {
         return hours
     }
 
-    /// Compact top-level badge shown when the weekly limit finishes soon.
-    func weeklyBadge(_ acct: Account) -> String? {
-        guard weeklyResetHoursLeft(acct) != nil else { return nil }
+    func hasWeeklyQuota(_ acct: Account) -> Bool {
+        acct.provider == "codex" || acct.provider == "claude" || acct.provider == "devin"
+    }
+
+    func hasMonthlyQuota(_ acct: Account) -> Bool {
+        acct.provider == "xai" || acct.provider == "copilot"
+    }
+
+    func weeklyResetEndsSoon(_ acct: Account) -> Bool {
+        guard hasWeeklyQuota(acct), acct.secondary_used_pct != nil else { return false }
+        return quotaResetHoursLeft(acct.secondary_reset) != nil
+    }
+
+    func monthlyResetEndsSoon(_ acct: Account) -> Bool {
+        guard hasMonthlyQuota(acct), acct.primary_used_pct != nil else { return false }
+        return quotaResetHoursLeft(acct.primary_reset) != nil
+    }
+
+    func weeklyQuotaLow(_ acct: Account) -> Bool {
+        guard hasWeeklyQuota(acct), let used = acct.secondary_used_pct else { return false }
+        return used > 80
+    }
+
+    func monthlyQuotaLow(_ acct: Account) -> Bool {
+        guard hasMonthlyQuota(acct), let used = acct.primary_used_pct else { return false }
+        return used > 80
+    }
+
+    /// Compact top-level badge shown when a weekly/monthly quota resets within
+    /// one day or has less than 20% remaining.
+    func endSoonBadge(_ acct: Account) -> String? {
+        guard weeklyResetEndsSoon(acct) || monthlyResetEndsSoon(acct) ||
+              weeklyQuotaLow(acct) || monthlyQuotaLow(acct) else { return nil }
         return t("finishes_soon")
     }
 
@@ -1339,15 +1377,24 @@ extension AppDelegate: NSMenuDelegate {
         if weekly, let s = acct.secondary_used_pct {
             items.append(infoItem(L10n.usedLine("weekly_limit", String(format: "%.1f", s), reset: acct.secondary_reset),
                                   width: width, accentPercent: true,
-                                  accentResetTime: weeklyResetHoursLeft(acct) != nil))
+                                  warnPercent: weeklyQuotaLow(acct),
+                                  accentResetTime: weeklyResetEndsSoon(acct)))
+        }
+        if acct.provider == "claude", let p = acct.fallback_used_pct {
+            items.append(infoItem(L10n.usedLine("fallback_limit", String(format: "%.1f", p)),
+                                  width: width, accentPercent: true))
         }
         if monthly, let p = acct.primary_used_pct {
             items.append(infoItem(L10n.usedLine("monthly_limit", String(format: "%.1f", p), reset: acct.primary_reset),
-                                  width: width, accentPercent: true))
+                                  width: width, accentPercent: true,
+                                  warnPercent: monthlyQuotaLow(acct),
+                                  accentResetTime: monthlyResetEndsSoon(acct)))
         }
         if let label = primaryLabel, let p = acct.primary_used_pct {
             items.append(infoItem(L10n.usedLine(label, String(format: "%.1f", p), reset: acct.primary_reset),
-                                  width: width, accentPercent: true))
+                                  width: width, accentPercent: true,
+                                  warnPercent: monthlyQuotaLow(acct),
+                                  accentResetTime: monthlyResetEndsSoon(acct)))
         }
         if credits, let b = acct.credits_balance {
             items.append(infoItem(L10n.label("additional_credits", String(format: "%.0f", b)), width: width))
@@ -1577,11 +1624,12 @@ extension AppDelegate: NSMenuDelegate {
     }
 
     func infoItem(_ title: String, width: CGFloat = MenuRowLayout.width,
-                  accentPercent: Bool = false, accentResetTime: Bool = false) -> NSMenuItem {
+                  accentPercent: Bool = false, warnPercent: Bool = false,
+                  accentResetTime: Bool = false) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.isEnabled = false
         item.view = FixedMenuRowView(title: title, style: .info, accentPercent: accentPercent,
-                                     accentResetTime: accentResetTime, width: width)
+                                     warnPercent: warnPercent, accentResetTime: accentResetTime, width: width)
         return item
     }
 

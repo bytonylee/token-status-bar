@@ -300,6 +300,7 @@ def cmd_export(conn) -> int:
             "monthly_used": float(snap["monthly_used"]) if snap and snap.get("monthly_used") is not None else None,
             "monthly_limit": float(snap["monthly_limit"]) if snap and snap.get("monthly_limit") is not None else None,
             "monthly_used_pct": float(snap["monthly_used_pct"]) if snap and snap.get("monthly_used_pct") is not None else None,
+            "monthly_period_start": iso_fmt(snap.get("monthly_period_start")) if snap and snap.get("monthly_period_start") else None,
             "monthly_period_end": iso_fmt(snap.get("monthly_period_end")) if snap and snap.get("monthly_period_end") else None,
             "reset_credits": [{"title": c["title"], "status": c["status"],
                                "expires_at": iso_fmt_exact(c["expires_at"]) or c["expires_at"],

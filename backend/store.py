@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS limit_snapshots (
     monthly_used REAL,
     monthly_limit REAL,
     monthly_used_pct REAL,
+    monthly_period_start TEXT,
     monthly_period_end TEXT,
     -- raw payload
     raw_json TEXT
@@ -121,6 +122,7 @@ def connect() -> sqlite3.Connection:
         ("monthly_used", "REAL"),
         ("monthly_limit", "REAL"),
         ("monthly_used_pct", "REAL"),
+        ("monthly_period_start", "TEXT"),
         ("monthly_period_end", "TEXT"),
     ]:
         if col not in scols:
@@ -193,7 +195,8 @@ def save_snapshot(conn, account_id, snap: dict):
               "rate_limit_limit","raw_json",
               "sku","limited_user_quotas","limited_user_reset_date",
               "daily_quota_remaining_percent","weekly_quota_remaining_percent","plan_reset_unix",
-              "monthly_used","monthly_limit","monthly_used_pct","monthly_period_end")
+              "monthly_used","monthly_limit","monthly_used_pct",
+              "monthly_period_start","monthly_period_end")
     vals = [snap.get(f) for f in fields]
     conn.execute(
         f"INSERT INTO limit_snapshots(account_id,ts,{','.join(fields)}) VALUES(?,?,{','.join('?'*len(fields))})",

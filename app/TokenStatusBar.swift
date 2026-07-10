@@ -227,6 +227,25 @@ class StatusLoader: ObservableObject {
         }
     }
 
+    func runHeartbeat(accountId: Int? = nil) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            var args = ["heartbeat"]
+            if let id = accountId {
+                args += ["--account", "\(id)"]
+            }
+            let task = self.poolProcess(args)
+            try? task.run()
+            task.waitUntilExit()
+            // heartbeat writes refresh_log only; export so the menu sees it.
+            let export = self.poolProcess(["export-status"])
+            try? export.run()
+            export.waitUntilExit()
+            DispatchQueue.main.async {
+                self.reload()
+            }
+        }
+    }
+
     func addAgent(provider: String) {
         // Devin needs an interactive API key, so keep Terminal for it.
         if provider == "devin" {
@@ -619,6 +638,8 @@ enum L10n {
             "heartbeat": "Heartbeat",
             "heartbeat_next": "Next",
             "heartbeat_last": "Last",
+            "heartbeat_last_success": "Last success",
+            "run_heartbeat_now": "Run Heartbeat Now",
             "heartbeat_success": "Success",
             "heartbeat_fail": "Fail",
             "heartbeat_unknown": "Unknown",
@@ -728,6 +749,8 @@ enum L10n {
             "heartbeat": "Heartbeat",
             "heartbeat_next": "다음",
             "heartbeat_last": "마지막",
+            "heartbeat_last_success": "마지막 성공",
+            "run_heartbeat_now": "지금 하트비트 실행",
             "heartbeat_success": "성공",
             "heartbeat_fail": "실패",
             "heartbeat_unknown": "알 수 없음",
@@ -837,6 +860,8 @@ enum L10n {
             "heartbeat": "Heartbeat",
             "heartbeat_next": "下次",
             "heartbeat_last": "上次",
+            "heartbeat_last_success": "上次成功",
+            "run_heartbeat_now": "立即运行 Heartbeat",
             "heartbeat_success": "成功",
             "heartbeat_fail": "失败",
             "heartbeat_unknown": "未知",
@@ -946,6 +971,8 @@ enum L10n {
             "heartbeat": "Heartbeat",
             "heartbeat_next": "次回",
             "heartbeat_last": "前回",
+            "heartbeat_last_success": "最終成功",
+            "run_heartbeat_now": "今すぐハートビート実行",
             "heartbeat_success": "成功",
             "heartbeat_fail": "失敗",
             "heartbeat_unknown": "不明",
@@ -1241,11 +1268,17 @@ extension AppDelegate: NSMenuDelegate {
             if let last = acct.heartbeat_last {
                 submenu.addItem(infoItem("\(t("heartbeat_last")): \(last)", width: width))
             }
+            if let lastOk = acct.heartbeat_last_success {
+                submenu.addItem(infoItem("\(t("heartbeat_last_success")): \(lastOk)", width: width))
+            }
             if let msg = acct.heartbeat_message, !msg.isEmpty {
                 submenu.addItem(infoItem(msg, width: width))
             }
             submenu.addItem(separatorRow(width: width))
         }
+        submenu.addItem(actionItem(t("run_heartbeat_now"), width: width) { [weak self] in
+            self?.loader.runHeartbeat()
+        })
         let failed = heartbeat.failed ?? 0
         let count = heartbeat.accounts ?? heartbeatAccounts.count
         let suffix = failed > 0 ? " · \(failed)/\(count) failed" : " · \(count) accounts"
@@ -1261,9 +1294,15 @@ extension AppDelegate: NSMenuDelegate {
         if let last = acct.heartbeat_last {
             submenu.addItem(infoItem("\(t("heartbeat_last")): \(last)", width: width))
         }
+        if let lastOk = acct.heartbeat_last_success {
+            submenu.addItem(infoItem("\(t("heartbeat_last_success")): \(lastOk)", width: width))
+        }
         if let msg = acct.heartbeat_message, !msg.isEmpty {
             submenu.addItem(infoItem(msg, width: width))
         }
+        submenu.addItem(actionItem(t("run_heartbeat_now"), width: width) { [weak self] in
+            self?.loader.runHeartbeat(accountId: acct.id)
+        })
     }
 
     func accountItem(_ acct: Account) -> NSMenuItem {

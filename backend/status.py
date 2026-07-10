@@ -7,6 +7,8 @@ import store
 STATUS_JSON = Path(os.environ.get("AGENT_POOL_STATUS_JSON",
                                     str(Path.home() / "solo/token-status-bar" / "secrets" / "status.json")))
 KST = zoneinfo.ZoneInfo("Asia/Seoul")
+HEARTBEAT_INTERVAL_S = 5 * 60 * 60
+HEARTBEAT_PROVIDERS = ("codex", "claude", "antigravity")
 
 
 def ts_fmt(ts) -> str:
@@ -85,6 +87,55 @@ def human_secs(s):
     if s < 3600: return f"{s//60}m"
     if s < 86400: return f"{s/3600:.1f}h"
     return f"{s/86400:.1f}d"
+
+
+def heartbeat_meta(conn, account_id) -> dict:
+    latest = conn.execute(
+        "SELECT * FROM refresh_log WHERE account_id=? AND kind='heartbeat' ORDER BY ts DESC LIMIT 1",
+        (account_id,),
+    ).fetchone()
+    latest_success = conn.execute(
+        "SELECT * FROM refresh_log WHERE account_id=? AND kind='heartbeat' AND success=1 ORDER BY ts DESC LIMIT 1",
+        (account_id,),
+    ).fetchone()
+    if not latest and not latest_success:
+        return {
+            "heartbeat_status": "unknown",
+            "heartbeat_last": None,
+            "heartbeat_next": "due now",
+            "heartbeat_message": None,
+            "heartbeat_next_ts": time.time(),
+        }
+    next_ts = (latest_success["ts"] + HEARTBEAT_INTERVAL_S) if latest_success else time.time()
+    return {
+        "heartbeat_status": "success" if latest and latest["success"] else "fail",
+        "heartbeat_last": ts_fmt(latest["ts"]) if latest else None,
+        "heartbeat_next": ts_fmt(next_ts),
+        "heartbeat_message": latest["message"] if latest else None,
+        "heartbeat_next_ts": next_ts,
+    }
+
+
+def heartbeat_summary(items: list[dict]) -> dict:
+    hb_items = [i for i in items if i.get("provider") in HEARTBEAT_PROVIDERS]
+    if not hb_items:
+        return {"status": "unknown", "next": None, "accounts": 0}
+    failed = [i for i in hb_items if i.get("heartbeat_status") == "fail"]
+    unknown = [i for i in hb_items if i.get("heartbeat_status") == "unknown"]
+    if failed:
+        status = "fail"
+    elif unknown:
+        status = "unknown"
+    else:
+        status = "success"
+    due = [i for i in hb_items if i.get("heartbeat_next_ts")]
+    next_ts = min((i["heartbeat_next_ts"] for i in due), default=None)
+    return {
+        "status": status,
+        "next": ts_fmt(next_ts) if next_ts else None,
+        "accounts": len(hb_items),
+        "failed": len(failed),
+    }
 
 
 def fmt_window(used, reset_at, window_s):
@@ -166,6 +217,16 @@ def claude_extra(snap) -> dict:
         return out
     prof = rj.get("profile") or {}
     rl = rj.get("ratelimit") or {}
+    fable = rj.get("fable") or {}
+    if fable:
+        if fable.get("used_pct") is not None:
+            out["fable_used_pct"] = fable["used_pct"]
+        if fable.get("reset_at") is not None:
+            out["fable_reset"] = ts_fmt(fable["reset_at"])
+        if fable.get("label"):
+            out["fable_label"] = fable["label"]
+        if fable.get("status"):
+            out["fable_status"] = fable["status"]
     if prof:
         out["subscription_status"] = prof.get("subscription_status")
         out["billing_type"] = prof.get("billing_type")
@@ -214,6 +275,19 @@ def provider_extra(provider, snap) -> dict:
         out["tier_id"] = extra.get("tier_id")
         out["tier_description"] = extra.get("tier_description")
         out["active_tier"] = extra.get("active_tier")
+        exported = []
+        for w in extra.get("usage_windows") or []:
+            if not isinstance(w, dict) or w.get("remaining_pct") is None:
+                continue
+            used = 100.0 - float(w["remaining_pct"])
+            exported.append({
+                "group": w.get("group"),
+                "window": w.get("window"),
+                "used_pct": round(max(0.0, min(100.0, used)), 2),
+                "reset": ts_fmt(w["reset_at"]) if w.get("reset_at") else None,
+            })
+        if exported:
+            out["usage_windows"] = exported
     elif provider == "copilot":
         out["access_sku"] = extra.get("access_sku")
         out["premium_entitlement"] = extra.get("premium_entitlement")
@@ -233,6 +307,37 @@ def provider_extra(provider, snap) -> dict:
         out["plan_start"] = ts_fmt(extra.get("plan_start_unix")) if extra.get("plan_start_unix") else None
         out["plan_reset"] = ts_fmt(extra.get("plan_reset_unix")) if extra.get("plan_reset_unix") else None
     return {k: v for k, v in out.items() if v is not None}
+
+
+def codex_extra(conn, account_id) -> dict:
+    """Codex subscription metadata from ChatGPT account endpoints."""
+    meta = store.get_subscription_meta(conn, account_id)
+    if not meta:
+        return {}
+    def _meta_bool(key: str):
+        value = meta.get(key)
+        return bool(value) if value is not None else None
+
+    end = meta.get("renews_at") or meta.get("expires_at")
+    out = {
+        "paid_since": iso_fmt(meta.get("paid_since")),
+        "renews_at": iso_fmt(meta.get("renews_at")),
+        "expires_at": iso_fmt(meta.get("expires_at")),
+        "account_created": iso_fmt(meta.get("account_created_at")),
+        "subscription_plan": meta.get("subscription_plan"),
+        "has_active_subscription": _meta_bool("has_active_subscription"),
+        "is_active_subscription_gratis": _meta_bool("is_active_subscription_gratis"),
+        "has_previously_paid_subscription": _meta_bool("has_previously_paid_subscription"),
+        "plan_start": iso_fmt(meta.get("paid_since")),
+        "plan_reset": iso_fmt(end),
+    }
+    months = meta.get("previous_paid_months")
+    note = meta.get("billing_note")
+    if months:
+        out["payment_history"] = f"previous {int(months)} months"
+    if note:
+        out["billing_note"] = note
+    return {k: v for k, v in out.items() if v is not None and v != ""}
 
 
 def plan_label(provider, plan, item) -> tuple:
@@ -328,7 +433,11 @@ def cmd_export(conn) -> int:
             "last_poll": ts_fmt(snap["ts"]) if snap else None,
             "tier_override": a.get("tier_override"),
         })
-        if a["provider"] == "claude":
+        if a["provider"] in HEARTBEAT_PROVIDERS:
+            items[-1].update(heartbeat_meta(conn, a["id"]))
+        if a["provider"] == "codex":
+            items[-1].update(codex_extra(conn, a["id"]))
+        elif a["provider"] == "claude":
             items[-1].update(claude_extra(snap))
         elif a["provider"] in ("xai", "antigravity", "copilot", "devin"):
             items[-1].update(provider_extra(a["provider"], snap))
@@ -338,6 +447,7 @@ def cmd_export(conn) -> int:
     payload = {
         "generated_at": datetime.datetime.now().isoformat(),
         "account_count": len(items),
+        "heartbeat": heartbeat_summary(items),
         "accounts": items,
     }
     STATUS_JSON.parent.mkdir(parents=True, exist_ok=True)

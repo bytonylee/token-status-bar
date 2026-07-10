@@ -9,7 +9,7 @@ Limit sources:
   devin:        server.codeium.com GetUserStatus protobuf (daily/weekly quota %)
 """
 from __future__ import annotations
-import json, os, sys, time, datetime, urllib.request, urllib.error
+import json, os, re, sys, time, datetime, urllib.request, urllib.error
 import store, oauth, work_queue
 
 WHAM = "https://chatgpt.com/backend-api"
@@ -73,7 +73,8 @@ def _post(url, data, headers, timeout=15):
 def poll_codex(conn, account, token):
     aid = account["account_id"] or ""
     headers = {"Authorization": f"Bearer {token['access_token']}",
-               "ChatGPT-Account-Id": aid, "User-Agent": "agent-pool/1.0"}
+               "ChatGPT-Account-Id": aid, "User-Agent": "agent-pool/1.0",
+               "OAI-Product-Sku": "codex"}
     # usage
     st, usage, _ = _get(f"{WHAM}/wham/usage", headers)
     snap = {"status": "active", "status_message": "", "raw_json": json.dumps({"usage": usage}) if isinstance(usage, dict) else str(usage)}
@@ -102,7 +103,59 @@ def poll_codex(conn, account, token):
     st2, credits, _ = _get(f"{WHAM}/wham/rate-limit-reset-credits", headers)
     if st2 == 200 and isinstance(credits, dict):
         store.replace_reset_credits(conn, account["id"], credits.get("credits") or [])
+    _sync_codex_subscription_meta(conn, account, headers)
     store.log_event(conn, account["id"], "limit_poll", True, "")
+
+
+def _sync_codex_subscription_meta(conn, account, headers):
+    """Best-effort ChatGPT account metadata sync for Codex subscriptions."""
+    aid = account.get("account_id") or ""
+    if not aid:
+        return
+    existing = store.get_subscription_meta(conn, account["id"]) or {}
+    account_created_at = existing.get("account_created_at")
+
+    st, accounts_body, _ = _get(f"{WHAM}/accounts", headers)
+    if st == 200 and isinstance(accounts_body, dict):
+        for item in accounts_body.get("items") or []:
+            if isinstance(item, dict) and item.get("id") == aid:
+                account_created_at = item.get("created_time") or account_created_at
+                break
+
+    st, check_body, _ = _get(f"{WHAM}/accounts/check/v4-2023-04-27", headers)
+    if st != 200 or not isinstance(check_body, dict):
+        return
+    entry = (check_body.get("accounts") or {}).get(aid) or {}
+    acct = entry.get("account") or {}
+    ent = entry.get("entitlement") or {}
+    if not acct and not ent:
+        return
+
+    renews_at = ent.get("renews_at")
+    expires_at = ent.get("expires_at")
+    gratis = ent.get("is_active_subscription_gratis")
+    plan = ent.get("subscription_plan")
+    if gratis:
+        note = f"active free promotion; expires_at={expires_at}" if expires_at else "active free promotion"
+    elif ent.get("has_active_subscription"):
+        note = f"active paid subscription; renews_at={renews_at}" if renews_at else "active paid subscription"
+    else:
+        note = "subscription metadata synced from accounts/check"
+
+    store.upsert_subscription_meta(
+        conn,
+        account["id"],
+        paid_since=existing.get("paid_since"),
+        renews_at=renews_at,
+        expires_at=expires_at,
+        account_created_at=account_created_at,
+        subscription_plan=plan,
+        has_active_subscription=ent.get("has_active_subscription"),
+        is_active_subscription_gratis=gratis,
+        has_previously_paid_subscription=acct.get("has_previously_paid_subscription"),
+        previous_paid_months=existing.get("previous_paid_months"),
+        billing_note=note,
+    )
 
 
 # ─── Claude headers ────────────────────────────────────────────────────────
@@ -143,6 +196,21 @@ def poll_claude(conn, account, token):
         if not isinstance(rj, dict):
             rj = {}
         rj["profile"] = profile
+        snap["raw_json"] = json.dumps(rj)
+    # Step 2: probe claude-fable-5 to read its model-scoped weekly window
+    # (anthropic-ratelimit-unified-7d_oi-*), the separate "Fable" weekly limit
+    # shown in Claude's usage UI. These headers only appear on responses to
+    # requests for that model tier, so an active probe is required. Best-effort:
+    # a failed/missing probe leaves the fable window empty without failing poll.
+    fable = _claude_fable_window(token)
+    if fable:
+        try:
+            rj = json.loads(snap.get("raw_json") or "{}")
+        except Exception:
+            rj = {}
+        if not isinstance(rj, dict):
+            rj = {}
+        rj["fable"] = fable
         snap["raw_json"] = json.dumps(rj)
     store.save_snapshot(conn, account["id"], snap)
     store.log_event(conn, account["id"], "limit_poll", snap["status"] == "active", snap.get("status_message", ""))
@@ -207,6 +275,70 @@ def _claude_snap(hdrs, status, msg):
     snap["rate_limit_reset"] = reset_5h
     snap["rate_limit_limit"] = "unified"
     return snap
+
+
+def _claude_fable_window(token):
+    """Probe claude-fable-5 to read its model-scoped weekly rate-limit window.
+
+    Claude exposes a separate weekly limit for the top model tier ("Fable" in
+    the usage UI) via headers shaped anthropic-ratelimit-unified-<window>-*
+    where <window> is e.g. 7d_oi. These only appear on responses to requests
+    for that model tier, so we send a 1-token Claude Code-shaped probe.
+    Matched generically so a renamed or newly added 7d_<label> window is
+    picked up as-is. Best-effort: returns None on any failure so the main poll
+    stays green.
+    """
+    body = json.dumps({
+        "model": "claude-fable-5",
+        "max_tokens": 1,
+        "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {token['access_token']}")
+    req.add_header("anthropic-version", "2023-06-01")
+    req.add_header("anthropic-beta", "oauth-2025-04-20")
+    hdrs = None
+    http_code = None
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            hdrs = dict(r.headers)
+    except urllib.error.HTTPError as e:
+        # Rate-limit headers (incl. the 7d_oi Fable window) are often attached
+        # to 429/error responses too — read them so a throttled probe still
+        # reports the Fable weekly utilization.
+        hdrs = dict(e.headers)
+        http_code = e.code
+    except urllib.error.URLError:
+        return None
+    win = None
+    for key, val in hdrs.items():
+        m = re.match(r"^anthropic-ratelimit-unified-(7d_[a-z0-9_]+)-(utilization|reset|status)$",
+                     key, re.IGNORECASE)
+        if not m:
+            continue
+        label, field = m.group(1), m.group(2)
+        if win is None:
+            win = {"label": label, "used_pct": None, "reset_at": None, "status": None}
+        if field == "utilization":
+            try:
+                win["used_pct"] = float(val) * 100
+            except (TypeError, ValueError):
+                pass
+        elif field == "reset":
+            try:
+                win["reset_at"] = float(val)
+            except (TypeError, ValueError):
+                pass
+        else:
+            win["status"] = val
+    # No 7d_<label> headers but a 429 means the Fable tier is rate-limited (or
+    # not yet provisioned) — record the state so the UI can surface a Fable row
+    # instead of silently omitting it.
+    if win is None and http_code == 429:
+        win = {"label": None, "used_pct": None, "reset_at": None, "status": "rate_limited"}
+    return win
 
 
 # ─── xAI headers ───────────────────────────────────────────────────────────
@@ -408,10 +540,17 @@ def poll_antigravity(conn, account, token):
         snap["status"] = "error"
         snap["status_message"] = str(e.reason)
 
+    try:
+        import agy_usage
+        usage_windows = agy_usage.fetch_usage()
+    except Exception:
+        usage_windows = None
+
     snap["raw_json"] = json.dumps({"extra": {
         "tier_id": tier_id,
         "tier_description": tier_desc,
         "active_tier": active_tier_id if active_tier_id and active_tier_id != tier_id else None,
+        "usage_windows": usage_windows,
     }})
     store.save_snapshot(conn, account["id"], snap)
     store.log_event(conn, account["id"], "limit_poll", snap["status"] == "active", snap.get("status_message", ""))
@@ -468,15 +607,30 @@ def _antigravity_quota(models, plan):
 
 # ─── Copilot token refresh + rate limit ────────────────────────────────────
 def poll_copilot(conn, account, token):
-    # Step 1: refresh the copilot token
+    # Step 1: refresh the copilot token. The copilot_internal/v2/token endpoint
+    # intermittently returns HTTP 403 "Resource not accessible by integration" —
+    # a transient GitHub-side entitlement re-check that resolves on the next
+    # poll. Retry once after a short backoff; if it still fails, hold the last
+    # good snapshot (so the menu bar doesn't flip red for one bad poll) and only
+    # write an error when there is no prior active snapshot to hold.
     raw = json.loads(token["raw_json"]) if token["raw_json"] else {}
     github_token = raw.get("github_token") or token["access_token"]
-    st, resp, hdrs = _get("https://api.github.com/copilot_internal/v2/token",
-                          {"Authorization": f"token {github_token}",
-                           "User-Agent": "agent-pool/1.0",
-                           "X-GitHub-Api-Version": "2025-04-01"})
+    token_url = "https://api.github.com/copilot_internal/v2/token"
+    token_hdrs = {"Authorization": f"token {github_token}",
+                  "User-Agent": "agent-pool/1.0",
+                  "X-GitHub-Api-Version": "2025-04-01"}
+    st, resp, hdrs = _get(token_url, token_hdrs)
+    if st in (403, 500, 502, 503, 504):
+        time.sleep(2)
+        st, resp, hdrs = _get(token_url, token_hdrs)
     if st != 200 or not isinstance(resp, dict):
-        snap = {"status": "error", "status_message": f"token refresh HTTP {st}: {str(resp)[:120]}"}
+        msg = f"token refresh HTTP {st}: {str(resp)[:120]}"
+        prior = store.latest_snapshot(conn, account["id"])
+        if prior and prior.get("status") == "active":
+            # Hold the last good snapshot; log the transient failure for audit.
+            store.log_event(conn, account["id"], "limit_poll", False, msg)
+            return
+        snap = {"status": "error", "status_message": msg}
         store.save_snapshot(conn, account["id"], snap)
         store.log_event(conn, account["id"], "limit_poll", False, snap["status_message"])
         return

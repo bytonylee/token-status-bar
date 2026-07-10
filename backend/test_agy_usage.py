@@ -59,5 +59,32 @@ class ParseUsagePanelTests(unittest.TestCase):
         self.assertIsNone(agy_usage.parse_usage_panel(""))
 
 
+import json
+import status  # noqa: E402
+
+
+class ExportShapeTests(unittest.TestCase):
+    def test_provider_extra_exports_usage_windows(self):
+        snap = {"raw_json": json.dumps({"extra": {
+            "tier_id": "g1-pro-tier",
+            "usage_windows": [
+                {"group": "gemini", "window": "5h",
+                 "remaining_pct": 99.45, "reset_at": 1_000_000.0},
+                {"group": "other", "window": "weekly",
+                 "remaining_pct": 100.0, "reset_at": None},
+            ],
+        }})}
+        out = status.provider_extra("antigravity", snap)
+        self.assertEqual(len(out["usage_windows"]), 2)
+        g5 = out["usage_windows"][0]
+        self.assertEqual(g5["group"], "gemini")
+        self.assertEqual(g5["window"], "5h")
+        self.assertAlmostEqual(g5["used_pct"], 0.55)
+        self.assertIsNotNone(g5["reset"])
+        ow = out["usage_windows"][1]
+        self.assertEqual(ow["used_pct"], 0.0)
+        self.assertIsNone(ow["reset"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

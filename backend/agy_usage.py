@@ -113,12 +113,15 @@ def fetch_usage(timeout_s: int = PANEL_TIMEOUT_S):
 def _drive(agy: str, timeout_s: int):
     pid, fd = pty.fork()
     if pid == 0:  # child: exec agy with a sane TERM, outside any repo
-        os.environ["TERM"] = "xterm-256color"
         try:
-            os.chdir("/tmp")
-        except OSError:
-            pass
-        os.execv(agy, [agy])
+            os.environ["TERM"] = "xterm-256color"
+            try:
+                os.chdir("/tmp")
+            except OSError:
+                pass
+            os.execv(agy, [agy])
+        finally:
+            os._exit(1)
     buf = b""
     try:
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 160, 0, 0))

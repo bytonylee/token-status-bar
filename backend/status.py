@@ -115,9 +115,11 @@ def next_monthly_anniversary(iso_start, now=None) -> datetime.datetime | None:
     if start is None:
         return None
     now_dt = now or datetime.datetime.now(datetime.timezone.utc)
+    months = 0
     candidate = start
     while candidate <= now_dt:
-        candidate = _shift_months(candidate, 1)
+        months += 1
+        candidate = _shift_months(start, months)
     return candidate
 
 

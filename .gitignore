@@ -1,12 +1,12 @@
 # ─── Runtime data (machine-local, contains account state) ─────────────
 # All secrets / local runtime data live in secrets/ (db, status.json, logs)
 secrets/
+/pool.db
 *.log
 
 # ─── Build artifacts ──────────────────────────────────────────────────
 build/
 TokenStatusBar.app/
-MenuBarAgent.app/
 *.dmg
 
 # ─── Python ───────────────────────────────────────────────────────────

@@ -30,6 +30,12 @@ class AnniversaryTests(unittest.TestCase):
         got = status.next_monthly_anniversary("2026-01-31T00:00:00Z", now=now)
         self.assertEqual(got, datetime.datetime(2026, 2, 28, tzinfo=UTC))
 
+    def test_month_end_does_not_drift(self):
+        # Jan 31 start: February clamps to 28, but March must return to 31.
+        now = datetime.datetime(2026, 3, 1, tzinfo=UTC)
+        got = status.next_monthly_anniversary("2026-01-31T00:00:00Z", now=now)
+        self.assertEqual(got, datetime.datetime(2026, 3, 31, tzinfo=UTC))
+
     def test_invalid_input_returns_none(self):
         self.assertIsNone(status.next_monthly_anniversary(None))
         self.assertIsNone(status.next_monthly_anniversary("not-a-date"))

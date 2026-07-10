@@ -1,6 +1,6 @@
 """Status display + JSON export for the menu bar app."""
 from __future__ import annotations
-import json, os, re, sys, time, datetime, zoneinfo
+import calendar, json, os, re, sys, time, datetime, zoneinfo
 from pathlib import Path
 import store
 
@@ -87,6 +87,46 @@ def human_secs(s):
     if s < 3600: return f"{s//60}m"
     if s < 86400: return f"{s/3600:.1f}h"
     return f"{s/86400:.1f}d"
+
+
+def _shift_months(dt: datetime.datetime, months: int) -> datetime.datetime:
+    month_index = dt.year * 12 + (dt.month - 1) + months
+    year, month = divmod(month_index, 12)
+    month += 1
+    last_day = calendar.monthrange(year, month)[1]
+    return dt.replace(year=year, month=month, day=min(dt.day, last_day))
+
+
+def _parse_iso(s) -> datetime.datetime | None:
+    if not s:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
+def next_monthly_anniversary(iso_start, now=None) -> datetime.datetime | None:
+    """First monthly recurrence of iso_start strictly after now (UTC)."""
+    start = _parse_iso(iso_start)
+    if start is None:
+        return None
+    now_dt = now or datetime.datetime.now(datetime.timezone.utc)
+    candidate = start
+    while candidate <= now_dt:
+        candidate = _shift_months(candidate, 1)
+    return candidate
+
+
+def previous_month(iso_date) -> datetime.datetime | None:
+    """iso_date shifted back one month, day clamped to month length."""
+    dt = _parse_iso(iso_date)
+    if dt is None:
+        return None
+    return _shift_months(dt, -1)
 
 
 def heartbeat_meta(conn, account_id) -> dict:
@@ -234,6 +274,9 @@ def claude_extra(snap) -> dict:
         out["extra_usage_enabled"] = prof.get("extra_usage_enabled")
         out["subscription_created"] = iso_fmt(prof.get("subscription_created_at"))
         out["plan_start"] = iso_fmt(prof.get("subscription_created_at"))
+        anniversary = next_monthly_anniversary(prof.get("subscription_created_at"))
+        if anniversary:
+            out["plan_reset"] = anniversary.astimezone(KST).strftime("%Y-%m-%d %H:%M")
         out["member_since"] = iso_fmt(prof.get("member_since"))
         out["display_name"] = prof.get("display_name")
         out["org_name"] = prof.get("org_name")
@@ -298,10 +341,14 @@ def provider_extra(provider, snap) -> dict:
         out["organizations"] = extra.get("organizations")
         out["github_email"] = extra.get("github_email")
         out["github_name"] = extra.get("github_name")
-        # plan_reset from the top-level "reset" field (quota_reset_date)
+        # plan_reset from the top-level "reset" field (quota_reset_date);
+        # plan_start derived as one month before the reset.
         reset_date = rj.get("reset")
         if reset_date:
             out["plan_reset"] = iso_fmt(reset_date) or reset_date
+            start_dt = previous_month(reset_date)
+            if start_dt:
+                out["plan_start"] = start_dt.strftime("%Y-%m-%d")
     elif provider == "devin":
         out["credit_balance"] = extra.get("credit_balance")
         out["plan_start"] = ts_fmt(extra.get("plan_start_unix")) if extra.get("plan_start_unix") else None

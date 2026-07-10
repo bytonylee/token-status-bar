@@ -1,11 +1,20 @@
 import Cocoa
+import Combine
 import SwiftUI
 
 // ─── Models ───────────────────────────────────────────────────────────────
 struct StatusPayload: Codable {
     var generated_at: String
     var account_count: Int
+    var heartbeat: HeartbeatSummary?
     var accounts: [Account]
+}
+
+struct HeartbeatSummary: Codable {
+    var status: String
+    var next: String?
+    var accounts: Int?
+    var failed: Int?
 }
 
 struct Account: Codable, Identifiable {
@@ -38,6 +47,10 @@ struct Account: Codable, Identifiable {
     var monthly_period_end: String?
     var reset_credits: [ResetCredit]?
     var last_poll: String?
+    var heartbeat_status: String?
+    var heartbeat_last: String?
+    var heartbeat_next: String?
+    var heartbeat_message: String?
     // Claude subscription / window-status details
     var subscription_status: String?
     var billing_type: String?
@@ -49,9 +62,13 @@ struct Account: Codable, Identifiable {
     var org_name: String?
     var primary_status: String?
     var secondary_status: String?
-    var fallback_used_pct: Double?
     var binding_window: String?
     var overage_status: String?
+    // Claude Fable model-scoped weekly window (separate weekly limit)
+    var fable_used_pct: Double?
+    var fable_reset: String?
+    var fable_label: String?
+    var fable_status: String?
     // Grok / Antigravity / Copilot / Devin subscription details
     var on_demand_cap: Int?
     var billing_period_start: String?
@@ -68,6 +85,16 @@ struct Account: Codable, Identifiable {
     var plan_start: String?
     var plan_price: String?
     var active_tier: String?
+    var paid_since: String?
+    var renews_at: String?
+    var expires_at: String?
+    var account_created: String?
+    var subscription_plan: String?
+    var has_active_subscription: Bool?
+    var is_active_subscription_gratis: Bool?
+    var has_previously_paid_subscription: Bool?
+    var payment_history: String?
+    var billing_note: String?
     var github_email: String?
     var github_name: String?
     var tier_override: String?
@@ -194,17 +221,7 @@ class StatusLoader: ObservableObject {
     func addAgent(provider: String) {
         // Devin needs an interactive API key, so keep Terminal for it.
         if provider == "devin" {
-            let cmd = poolShellCommand(["add-devin"])
-            let script = """
-            tell application "Terminal"
-                activate
-                do script "\(cmd)"
-            end tell
-            """
-            let task = Process()
-            task.launchPath = "/usr/bin/osascript"
-            task.arguments = ["-e", script]
-            try? task.run()
+            runPoolInTerminal(["add-devin"])
             return
         }
         // Other providers use browser OAuth — run in background, then
@@ -217,6 +234,65 @@ class StatusLoader: ObservableObject {
                 self.reload()
             }
         }
+    }
+
+    func reconnectAgent(_ acct: Account) {
+        if acct.provider == "devin" {
+            reconnectDevinAgent(acct)
+            return
+        }
+        if acct.provider == "copilot" {
+            runPoolInTerminal(["reconnect", "\(acct.id)"])
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let task = self.poolProcess(["reconnect", "\(acct.id)"])
+            try? task.run()
+            task.waitUntilExit()
+            DispatchQueue.main.async {
+                self.reload()
+            }
+        }
+    }
+
+    private func reconnectDevinAgent(_ acct: Account) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = L10n.tr("devin_api_key_title")
+        alert.informativeText = L10n.tr("devin_api_key_message")
+        alert.addButton(withTitle: L10n.tr("reconnect_agent"))
+        alert.addButton(withTitle: L10n.tr("cancel"))
+        let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        input.placeholderString = "API key"
+        alert.accessoryView = input
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let apiKey = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiKey.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let task = self.poolProcess(["reconnect", "\(acct.id)", apiKey])
+            try? task.run()
+            task.waitUntilExit()
+            DispatchQueue.main.async {
+                self.reload()
+            }
+        }
+    }
+
+    private func runPoolInTerminal(_ args: [String]) {
+        let cmd = poolShellCommand(args)
+        let escapedCmd = cmd
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let script = """
+        tell application "Terminal"
+            activate
+            do script "\(escapedCmd)"
+        end tell
+        """
+        let task = Process()
+        task.launchPath = "/usr/bin/osascript"
+        task.arguments = ["-e", script]
+        try? task.run()
     }
 
     func deleteAgent(accountId: Int) {
@@ -531,6 +607,15 @@ enum L10n {
             "add_new_agent": "Add New Agent",
             "language": "Language",
             "quit": "Quit",
+            "heartbeat": "Heartbeat",
+            "heartbeat_next": "Next",
+            "heartbeat_last": "Last",
+            "heartbeat_success": "Success",
+            "heartbeat_fail": "Fail",
+            "heartbeat_unknown": "Unknown",
+            "reconnect_agent": "Reconnect This Account",
+            "devin_api_key_title": "Reconnect Devin",
+            "devin_api_key_message": "Enter the API key for this Devin account.",
             "delete_agent": "Delete This Agent",
             "delete_agent_confirm": "Remove %@ from the agent pool? This cannot be undone.",
             "cancel": "Cancel",
@@ -567,6 +652,7 @@ enum L10n {
             "credit_balance": "Credit balance",
             "plan_started": "Plan started",
             "plan_resets": "Plan resets",
+            "plan_expires": "Plan expires",
             "remaining": "Remaining",
             "reset": "Reset",
             "limit": "Limit",
@@ -574,8 +660,11 @@ enum L10n {
             "sku": "SKU",
             "quota_limit": "Quota limit",
             "quota_reset": "Quota reset",
+            "account_created": "Account created",
+            "payment_history": "Previous payments",
             // ── Messages ──
             "no_details": "No details",
+            "na": "n/a",
             "updated": "UPDATED",
             "loading": "Loading…",
             // ── Booleans ──
@@ -588,7 +677,8 @@ enum L10n {
             // ── Limit names ──
             "5h_limit": "5h limit",
             "weekly_limit": "weekly limit",
-            "fallback_limit": "fallback limit",
+            "fable_limit": "Fable limit",
+            "fable_rate_limited": "rate-limited",
             "monthly_limit": "monthly limit",
             "daily_tokens": "daily tokens",
             "tier_usage": "tier usage",
@@ -624,6 +714,15 @@ enum L10n {
             "add_new_agent": "새 에이전트 추가",
             "language": "언어",
             "quit": "종료",
+            "heartbeat": "Heartbeat",
+            "heartbeat_next": "다음",
+            "heartbeat_last": "마지막",
+            "heartbeat_success": "성공",
+            "heartbeat_fail": "실패",
+            "heartbeat_unknown": "알 수 없음",
+            "reconnect_agent": "계정 다시 연결하기",
+            "devin_api_key_title": "Devin 다시 연결",
+            "devin_api_key_message": "이 Devin 계정의 API 키를 입력하세요.",
             "delete_agent": "이 에이전트 삭제",
             "delete_agent_confirm": "%@ 를 에이전트 풀에서 삭제하시겠습니까? 되돌릴 수 없습니다.",
             "cancel": "취소",
@@ -660,6 +759,7 @@ enum L10n {
             "credit_balance": "크레딧 잔액",
             "plan_started": "플랜 시작",
             "plan_resets": "플랜 리셋",
+            "plan_expires": "플랜 만료",
             "remaining": "남음",
             "reset": "리셋",
             "limit": "한도",
@@ -667,8 +767,11 @@ enum L10n {
             "sku": "SKU",
             "quota_limit": "할당량 한도",
             "quota_reset": "할당량 리셋",
+            "account_created": "계정 생성",
+            "payment_history": "이전 결제",
             // ── Messages ──
             "no_details": "상세 정보 없음",
+            "na": "정보 없음",
             "updated": "업데이트",
             "loading": "불러오는 중…",
             // ── Booleans ──
@@ -681,7 +784,8 @@ enum L10n {
             // ── Limit names ──
             "5h_limit": "5시간 제한",
             "weekly_limit": "주간 제한",
-            "fallback_limit": "폴백 제한",
+            "fable_limit": "Fable 제한",
+            "fable_rate_limited": "제한 도달",
             "monthly_limit": "월간 제한",
             "daily_tokens": "일일 토큰",
             "tier_usage": "티어 사용량",
@@ -717,6 +821,15 @@ enum L10n {
             "add_new_agent": "添加新代理",
             "language": "语言",
             "quit": "退出",
+            "heartbeat": "Heartbeat",
+            "heartbeat_next": "下次",
+            "heartbeat_last": "上次",
+            "heartbeat_success": "成功",
+            "heartbeat_fail": "失败",
+            "heartbeat_unknown": "未知",
+            "reconnect_agent": "重新连接此账户",
+            "devin_api_key_title": "重新连接 Devin",
+            "devin_api_key_message": "输入此 Devin 账户的 API 密钥。",
             "delete_agent": "删除此代理",
             "delete_agent_confirm": "从代理池中移除 %@？此操作无法撤销。",
             "cancel": "取消",
@@ -753,6 +866,7 @@ enum L10n {
             "credit_balance": "积分余额",
             "plan_started": "计划开始",
             "plan_resets": "计划重置",
+            "plan_expires": "计划到期",
             "remaining": "剩余",
             "reset": "重置",
             "limit": "限额",
@@ -760,8 +874,11 @@ enum L10n {
             "sku": "SKU",
             "quota_limit": "配额限制",
             "quota_reset": "配额重置",
+            "account_created": "账户创建",
+            "payment_history": "历史付款",
             // ── Messages ──
             "no_details": "无详情",
+            "na": "暂无",
             "updated": "已更新",
             "loading": "加载中…",
             // ── Booleans ──
@@ -774,7 +891,8 @@ enum L10n {
             // ── Limit names ──
             "5h_limit": "5小时限制",
             "weekly_limit": "每周限制",
-            "fallback_limit": "回退限制",
+            "fable_limit": "Fable 限制",
+            "fable_rate_limited": "已达限制",
             "monthly_limit": "每月限制",
             "daily_tokens": "每日令牌",
             "tier_usage": "层级用量",
@@ -810,6 +928,15 @@ enum L10n {
             "add_new_agent": "新しいエージェントを追加",
             "language": "言語",
             "quit": "終了",
+            "heartbeat": "Heartbeat",
+            "heartbeat_next": "次回",
+            "heartbeat_last": "前回",
+            "heartbeat_success": "成功",
+            "heartbeat_fail": "失敗",
+            "heartbeat_unknown": "不明",
+            "reconnect_agent": "このアカウントを再接続",
+            "devin_api_key_title": "Devin を再接続",
+            "devin_api_key_message": "この Devin アカウントの API キーを入力してください。",
             "delete_agent": "このエージェントを削除",
             "delete_agent_confirm": "%@ をエージェントプールから削除しますか？この操作は元に戻せません。",
             "cancel": "キャンセル",
@@ -846,6 +973,7 @@ enum L10n {
             "credit_balance": "クレジット残高",
             "plan_started": "プラン開始",
             "plan_resets": "プランリセット",
+            "plan_expires": "プラン期限",
             "remaining": "残り",
             "reset": "リセット",
             "limit": "上限",
@@ -853,8 +981,11 @@ enum L10n {
             "sku": "SKU",
             "quota_limit": "クォータ上限",
             "quota_reset": "クォータリセット",
+            "account_created": "アカウント作成",
+            "payment_history": "過去の支払い",
             // ── Messages ──
             "no_details": "詳細なし",
+            "na": "情報なし",
             "updated": "更新",
             "loading": "読み込み中…",
             // ── Booleans ──
@@ -867,7 +998,8 @@ enum L10n {
             // ── Limit names ──
             "5h_limit": "5時間制限",
             "weekly_limit": "週間制限",
-            "fallback_limit": "フォールバック制限",
+            "fable_limit": "Fable 制限",
+            "fable_rate_limited": "制限に達しました",
             "monthly_limit": "月間制限",
             "daily_tokens": "日次トークン",
             "tier_usage": "ティア使用量",
@@ -936,27 +1068,73 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var loader = StatusLoader()
     var popover: NSPopover!
     var language: Language = .en
+    private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         language = Language.current
         L10n.lang = language
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem.button {
-            if let image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "Agent Pool") {
-                image.isTemplate = true
-                button.image = image
-            } else {
-                button.title = "AP"
-            }
-        }
+        updateStatusIcon()
 
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
 
+        loader.$payload
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateStatusIcon() }
+            .store(in: &cancellables)
+
         loader.start()
 
         NSApp.setActivationPolicy(.accessory)
+    }
+
+    /// Pool-wide health shown as the icon's corner dot.
+    private func poolDotColor() -> NSColor {
+        guard let payload = loader.payload else { return .systemOrange }
+        if (payload.heartbeat?.failed ?? 0) > 0
+            || payload.accounts.contains(where: { $0.status == "error" || $0.heartbeat_status == "fail" }) {
+            return .systemRed
+        }
+        if payload.accounts.contains(where: { $0.status == "expired" }) {
+            return .systemOrange
+        }
+        return .systemGreen
+    }
+
+    private func updateStatusIcon() {
+        guard let button = statusItem.button else { return }
+        guard let symbol = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "Agent Pool")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)) else {
+            button.title = "AP"
+            return
+        }
+        let dotColor = poolDotColor()
+        let size = NSSize(width: 18, height: 18)
+        let image = NSImage(size: size, flipped: false) { rect in
+            let symbolRect = NSRect(x: (rect.width - symbol.size.width) / 2,
+                                    y: (rect.height - symbol.size.height) / 2,
+                                    width: symbol.size.width,
+                                    height: symbol.size.height)
+            symbol.draw(in: symbolRect)
+            NSColor.labelColor.set()
+            symbolRect.fill(using: .sourceAtop)
+
+            let dotRect = NSRect(x: rect.maxX - 7, y: 0, width: 7, height: 7)
+            if let ctx = NSGraphicsContext.current {
+                // Punch a gap around the dot so it reads against the bars.
+                ctx.compositingOperation = .destinationOut
+                NSBezierPath(ovalIn: dotRect.insetBy(dx: -1.5, dy: -1.5)).fill()
+                ctx.compositingOperation = .sourceOver
+            }
+            dotColor.setFill()
+            NSBezierPath(ovalIn: dotRect).fill()
+            return true
+        }
+        image.isTemplate = false
+        image.accessibilityDescription = "Agent Pool"
+        button.image = image
     }
 
     @objc func quitApp() {
@@ -985,6 +1163,9 @@ extension AppDelegate: NSMenuDelegate {
         // Header
         menu.addItem(titleItem("Agent Pool: \(payload.account_count) accounts"))
         menu.addItem(infoItem("\(t("updated")): \(formatUpdated(payload.generated_at))"))
+        if let heartbeat = payload.heartbeat {
+            menu.addItem(heartbeatItem(heartbeat, accounts: payload.accounts))
+        }
         menu.addItem(separatorRow())
 
         // Group by provider
@@ -1008,6 +1189,63 @@ extension AppDelegate: NSMenuDelegate {
         case "error": return .systemRed
         case "expired": return .systemYellow
         default: return .tertiaryLabelColor
+        }
+    }
+
+    private func heartbeatColor(_ status: String) -> NSColor {
+        switch status {
+        case "success": return .systemGreen
+        case "fail": return .systemRed
+        default: return .systemYellow
+        }
+    }
+
+    private func heartbeatStatusText(_ status: String?) -> String {
+        switch status {
+        case "success": return t("heartbeat_success")
+        case "fail": return t("heartbeat_fail")
+        default: return t("heartbeat_unknown")
+        }
+    }
+
+    private func heartbeatLine(status: String?, next: String?) -> String {
+        "\(t("heartbeat")): \(heartbeatStatusText(status)) · \(t("heartbeat_next")) \(next ?? "?")"
+    }
+
+    func heartbeatItem(_ heartbeat: HeartbeatSummary, accounts: [Account]) -> NSMenuItem {
+        let submenu = NSMenu()
+        let width: CGFloat = 360
+        let heartbeatAccounts = accounts.filter { ["codex", "claude", "antigravity"].contains($0.provider) }
+        for acct in heartbeatAccounts {
+            let name = acct.email ?? acct.label ?? "account #\(acct.id)"
+            submenu.addItem(infoItem("\(providerDisplayName(acct.provider)): \(name)", width: width))
+            submenu.addItem(infoItem(heartbeatLine(status: acct.heartbeat_status, next: acct.heartbeat_next),
+                                     width: width))
+            if let last = acct.heartbeat_last {
+                submenu.addItem(infoItem("\(t("heartbeat_last")): \(last)", width: width))
+            }
+            if let msg = acct.heartbeat_message, !msg.isEmpty {
+                submenu.addItem(infoItem(msg, width: width))
+            }
+            submenu.addItem(separatorRow(width: width))
+        }
+        let failed = heartbeat.failed ?? 0
+        let count = heartbeat.accounts ?? heartbeatAccounts.count
+        let suffix = failed > 0 ? " · \(failed)/\(count) failed" : " · \(count) accounts"
+        return submenuRow(heartbeatLine(status: heartbeat.status, next: heartbeat.next) + suffix,
+                          submenu: submenu,
+                          dotColor: heartbeatColor(heartbeat.status))
+    }
+
+    private func addHeartbeatStatus(_ submenu: NSMenu, acct: Account, width: CGFloat) {
+        guard acct.heartbeat_status != nil || acct.heartbeat_next != nil || acct.heartbeat_last != nil else { return }
+        submenu.addItem(groupHeaderItem(t("heartbeat"), width: width))
+        submenu.addItem(infoItem(heartbeatLine(status: acct.heartbeat_status, next: acct.heartbeat_next), width: width))
+        if let last = acct.heartbeat_last {
+            submenu.addItem(infoItem("\(t("heartbeat_last")): \(last)", width: width))
+        }
+        if let msg = acct.heartbeat_message, !msg.isEmpty {
+            submenu.addItem(infoItem(msg, width: width))
         }
     }
 
@@ -1036,6 +1274,13 @@ extension AppDelegate: NSMenuDelegate {
             }
         }
         submenu.addItem(separatorRow(width: detailWidth))
+        addHeartbeatStatus(submenu, acct: acct, width: detailWidth)
+        if acct.heartbeat_status != nil || acct.heartbeat_next != nil || acct.heartbeat_last != nil {
+            submenu.addItem(separatorRow(width: detailWidth))
+        }
+        submenu.addItem(actionItem(t("reconnect_agent"), width: detailWidth) { [weak self] in
+            self?.loader.reconnectAgent(acct)
+        })
         submenu.addItem(actionItem(t("delete_agent"), width: detailWidth, destructive: true) { [weak self] in
             self?.loader.confirmDeleteAgent(acct: acct)
         })
@@ -1225,6 +1470,9 @@ extension AppDelegate: NSMenuDelegate {
     func planResetText(_ acct: Account) -> String? {
         let end = acct.plan_reset ?? acct.monthly_period_end
         if let end, !end.isEmpty {
+            if acct.provider == "codex", acct.is_active_subscription_gratis == true {
+                return L10n.label("plan_expires", end)
+            }
             return L10n.label("plan_resets", end)
         }
         return nil
@@ -1280,22 +1528,14 @@ extension AppDelegate: NSMenuDelegate {
 
     func buildCodexSubmenu(_ submenu: NSMenu, acct: Account, width: CGFloat) {
         // ─── Status group ───
-        submenu.addItem(groupHeaderItem("Status", width: width))
-        if let line = planText(acct) {
-            submenu.addItem(infoItem(line, width: width))
+        var extra: [(String, String)] = []
+        if let created = acct.account_created, !created.isEmpty {
+            extra.append(("account_created", created))
         }
-        if let start = planStartText(acct) {
-            submenu.addItem(infoItem(start, width: width))
+        if let history = acct.payment_history, !history.isEmpty {
+            extra.append(("payment_history", history))
         }
-        if let reset = planResetText(acct) {
-            submenu.addItem(infoItem(reset, width: width))
-        }
-        if let exp = acct.token_expires {
-            submenu.addItem(infoItem(L10n.label("token_expires", exp), width: width))
-        }
-        if let lp = acct.last_poll {
-            submenu.addItem(infoItem(L10n.label("last_poll", lp), width: width))
-        }
+        statusGroup(submenu, acct: acct, width: width, extra: extra)
 
         // ─── Limit session group ───
         limitSessionGroup(submenu, acct: acct, width: width, fiveHour: true, weekly: true, credits: true)
@@ -1323,44 +1563,27 @@ extension AppDelegate: NSMenuDelegate {
 
     func buildClaudeSubmenu(_ submenu: NSMenu, acct: Account, width: CGFloat) {
         // ─── Status group ───
-        submenu.addItem(groupHeaderItem("Status", width: width))
-        if let line = planText(acct) {
-            submenu.addItem(infoItem(line, width: width))
-        }
-        if let start = planStartText(acct) {
-            submenu.addItem(infoItem(start, width: width))
-        }
-        if let reset = planResetText(acct) {
-            submenu.addItem(infoItem(reset, width: width))
-        }
-        if let exp = acct.token_expires {
-            submenu.addItem(infoItem(L10n.label("token_expires", exp), width: width))
-        }
-        if let lp = acct.last_poll {
-            submenu.addItem(infoItem(L10n.label("last_poll", lp), width: width))
-        }
+        statusGroup(submenu, acct: acct, width: width)
 
         // ─── Limit session group ───
         limitSessionGroup(submenu, acct: acct, width: width, fiveHour: true, weekly: true)
     }
 
     private func statusGroup(_ submenu: NSMenu, acct: Account, width: CGFloat, extra: [(String, String)] = []) {
-        submenu.addItem(groupHeaderItem("Status", width: width))
+        submenu.addItem(groupHeaderItem(t("status"), width: width))
+        let na = t("na")
         if let line = planText(acct) {
             submenu.addItem(infoItem(line, width: width))
+        } else {
+            submenu.addItem(infoItem(L10n.label("plan", na), width: width))
         }
-        if let start = planStartText(acct) {
-            submenu.addItem(infoItem(start, width: width))
+        submenu.addItem(infoItem(planStartText(acct) ?? L10n.label("plan_started", na), width: width))
+        submenu.addItem(infoItem(planResetText(acct) ?? L10n.label("plan_resets", na), width: width))
+        for (key, value) in extra {
+            submenu.addItem(infoItem(L10n.label(key, value), width: width))
         }
-        if let reset = planResetText(acct) {
-            submenu.addItem(infoItem(reset, width: width))
-        }
-        if let exp = acct.token_expires {
-            submenu.addItem(infoItem(L10n.label("token_expires", exp), width: width))
-        }
-        if let lp = acct.last_poll {
-            submenu.addItem(infoItem(L10n.label("last_poll", lp), width: width))
-        }
+        submenu.addItem(infoItem(L10n.label("token_expires", acct.token_expires ?? na), width: width))
+        submenu.addItem(infoItem(L10n.label("last_poll", acct.last_poll ?? na), width: width))
     }
 
     /// Limit session group: only 5h / weekly / monthly / additional credits,
@@ -1380,9 +1603,12 @@ extension AppDelegate: NSMenuDelegate {
                                   warnPercent: weeklyQuotaLow(acct),
                                   accentResetTime: weeklyResetEndsSoon(acct)))
         }
-        if acct.provider == "claude", let p = acct.fallback_used_pct {
-            items.append(infoItem(L10n.usedLine("fallback_limit", String(format: "%.1f", p)),
+        if acct.provider == "claude", let p = acct.fable_used_pct {
+            items.append(infoItem(L10n.usedLine("fable_limit", String(format: "%.1f", p), reset: acct.fable_reset),
                                   width: width, accentPercent: true))
+        } else if acct.provider == "claude", let st = acct.fable_status, !st.isEmpty {
+            items.append(infoItem("\(L10n.tr("fable_limit")): \(L10n.tr("fable_\(st)"))",
+                                  width: width))
         }
         if monthly, let p = acct.primary_used_pct {
             items.append(infoItem(L10n.usedLine("monthly_limit", String(format: "%.1f", p), reset: acct.primary_reset),

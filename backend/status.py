@@ -142,6 +142,7 @@ def heartbeat_meta(conn, account_id) -> dict:
         return {
             "heartbeat_status": "unknown",
             "heartbeat_last": None,
+            "heartbeat_last_success": None,
             "heartbeat_next": "due now",
             "heartbeat_message": None,
             "heartbeat_next_ts": time.time(),
@@ -150,6 +151,7 @@ def heartbeat_meta(conn, account_id) -> dict:
     return {
         "heartbeat_status": "success" if latest and latest["success"] else "fail",
         "heartbeat_last": ts_fmt(latest["ts"]) if latest else None,
+        "heartbeat_last_success": ts_fmt(latest_success["ts"]) if latest_success else None,
         "heartbeat_next": ts_fmt(next_ts),
         "heartbeat_message": latest["message"] if latest else None,
         "heartbeat_next_ts": next_ts,

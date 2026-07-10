@@ -7,11 +7,15 @@ Usage:
                                        --incognito: open a private browser window (use when
                                                     adding a 2nd account on the same provider)
   pool.py add-devin <api_key> [label]  Add Devin account by API key
+  pool.py reconnect <account_id> [api_key] [--incognito]
+                                      Reconnect an existing account in place
   pool.py list                         List all accounts
   pool.py remove <account_id>          Remove an account
   pool.py status                       Show all accounts + latest limit status
   pool.py poll                         Run one poll cycle (hit all limit endpoints)
   pool.py poll-loop                    Run poller daemon (5-min interval)
+  pool.py heartbeat [--account <id>]   One keep-alive cycle (codex/claude/agy → "hi")
+  pool.py heartbeat-loop               Heartbeat daemon (5-hour interval)
   pool.py refresh <account_id>         Refresh token for one account
   pool.py refresh-all                  Refresh all expiring tokens
   pool.py reset <account_id>           Redeem a Codex banked reset credit
@@ -91,6 +95,50 @@ def cmd_add_devin(api_key, label=None):
     import poller
     account = store.get_account(DB, acct_id)
     print("Fetching initial subscription data...")
+    poller.poll_account(DB, account)
+    return 0
+
+
+# ─── reconnect ─────────────────────────────────────────────────────────────
+def cmd_reconnect(account_id, api_key=None, incognito=False):
+    acct_id = int(account_id)
+    account = store.get_account(DB, acct_id)
+    if not account:
+        print(f"Account {account_id} not found")
+        return 1
+    provider = account["provider"]
+    print(f"\n=== Reconnecting {account['label'] or account['email'] or account_id} ({provider}) ===")
+    try:
+        if provider == "devin":
+            if not api_key:
+                print("usage: pool.py reconnect <account_id> <api_key>")
+                return 1
+            result = oauth.login_devin(api_key)
+        else:
+            if provider not in oauth.LOGIN_FUNCS:
+                print(f"No reconnect flow for {provider}")
+                return 1
+            result = oauth.LOGIN_FUNCS[provider](incognito=incognito)
+    except Exception as e:
+        print(f"Reconnect failed: {e}")
+        store.log_event(DB, acct_id, "reconnect", False, str(e))
+        return 1
+
+    email = result.get("email") or account.get("email") or "unknown"
+    existing = store.get_account_by_provider_email(DB, provider, email)
+    if existing and existing["id"] != acct_id:
+        print(f"{provider} / {email} is already account #{existing['id']}; not overwriting account #{acct_id}")
+        store.log_event(DB, acct_id, "reconnect", False, f"duplicate account: {email}")
+        return 1
+
+    store.update_account(DB, acct_id, email, result.get("plan"), result.get("account_id"))
+    store.save_token(DB, acct_id, result["access_token"], result.get("refresh_token"),
+                     result.get("id_token"), result.get("expires_at"), result.get("raw"))
+    store.log_event(DB, acct_id, "reconnect", True, f"{provider} {email}")
+    print(f"✓ Reconnected: {provider} / {email} (account #{acct_id})")
+    import poller
+    account = store.get_account(DB, acct_id)
+    print("Fetching subscription data...")
     poller.poll_account(DB, account)
     return 0
 
@@ -208,6 +256,19 @@ def main(argv):
             print("usage: pool.py add-devin <api_key> [label]")
             return 1
         return cmd_add_devin(argv[1], argv[2] if len(argv) > 2 else None)
+    if cmd == "reconnect":
+        args = argv[1:]
+        incognito = False
+        if "--incognito" in args:
+            incognito = True
+            args.remove("--incognito")
+        elif "-i" in args:
+            incognito = True
+            args.remove("-i")
+        if not args:
+            print("usage: pool.py reconnect <account_id> [api_key] [--incognito]")
+            return 1
+        return cmd_reconnect(args[0], args[1] if len(args) > 1 else None, incognito)
     if cmd == "list":
         return cmd_list()
     if cmd == "remove":
@@ -231,6 +292,20 @@ def main(argv):
     if cmd == "poll-loop":
         import poller
         return poller.run_loop(DB)
+    if cmd == "heartbeat":
+        import heartbeat
+        args = argv[1:]
+        account_id = None
+        if "--account" in args:
+            i = args.index("--account")
+            if i + 1 >= len(args):
+                print("usage: pool.py heartbeat [--account <id>]")
+                return 1
+            account_id = int(args[i + 1])
+        return heartbeat.run_once(DB, account_id)
+    if cmd == "heartbeat-loop":
+        import heartbeat
+        return heartbeat.run_loop(DB)
     if cmd == "export-status":
         import status
         return status.cmd_export(DB)

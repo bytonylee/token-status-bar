@@ -70,5 +70,26 @@ class WiringTests(unittest.TestCase):
         self.assertEqual(out["plan_start"], "2026-07-01")
 
 
+import store  # noqa: E402
+
+
+class HeartbeatMetaTests(unittest.TestCase):
+    def test_last_success_survives_later_failure(self):
+        conn = store.connect()
+        acct_id = store.upsert_account(conn, "claude", "hb@example.com", "hb", None, None)
+        store.log_event(conn, acct_id, "heartbeat", True, "hi")
+        store.log_event(conn, acct_id, "heartbeat", False, "boom")
+        meta = status.heartbeat_meta(conn, acct_id)
+        self.assertEqual(meta["heartbeat_status"], "fail")
+        self.assertIsNotNone(meta["heartbeat_last_success"])
+        self.assertIsNotNone(meta["heartbeat_last"])
+
+    def test_no_rows_reports_none(self):
+        conn = store.connect()
+        acct_id = store.upsert_account(conn, "codex", "hb2@example.com", "hb2", None, None)
+        meta = status.heartbeat_meta(conn, acct_id)
+        self.assertIsNone(meta["heartbeat_last_success"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

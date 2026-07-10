@@ -98,6 +98,8 @@ struct Account: Codable, Identifiable {
     var github_email: String?
     var github_name: String?
     var tier_override: String?
+    var heartbeat_last_success: String?
+    var usage_windows: [UsageWindow]?
 }
 
 struct ResetCredit: Codable {
@@ -106,6 +108,13 @@ struct ResetCredit: Codable {
     var expires_at: String?
     var granted_at: String?
     var description: String?
+}
+
+struct UsageWindow: Codable {
+    var group: String?
+    var window: String?
+    var used_pct: Double?
+    var reset: String?
 }
 
 // ─── Status Loader ────────────────────────────────────────────────────────
@@ -682,6 +691,8 @@ enum L10n {
             "monthly_limit": "monthly limit",
             "daily_tokens": "daily tokens",
             "tier_usage": "tier usage",
+            "ag_group_gemini": "Gemini models",
+            "ag_group_other": "Claude & GPT models",
             "premium_requests": "premium requests",
             "chat_limit": "chat",
             "daily_limit": "daily limit",
@@ -789,6 +800,8 @@ enum L10n {
             "monthly_limit": "월간 제한",
             "daily_tokens": "일일 토큰",
             "tier_usage": "티어 사용량",
+            "ag_group_gemini": "Gemini 모델",
+            "ag_group_other": "Claude & GPT 모델",
             "premium_requests": "프리미엄 요청",
             "chat_limit": "채팅",
             "daily_limit": "일일 제한",
@@ -896,6 +909,8 @@ enum L10n {
             "monthly_limit": "每月限制",
             "daily_tokens": "每日令牌",
             "tier_usage": "层级用量",
+            "ag_group_gemini": "Gemini 模型",
+            "ag_group_other": "Claude & GPT 模型",
             "premium_requests": "高级请求",
             "chat_limit": "聊天",
             "daily_limit": "每日限制",
@@ -1003,6 +1018,8 @@ enum L10n {
             "monthly_limit": "月間制限",
             "daily_tokens": "日次トークン",
             "tier_usage": "ティア使用量",
+            "ag_group_gemini": "Gemini モデル",
+            "ag_group_other": "Claude & GPT モデル",
             "premium_requests": "プレミアムリクエスト",
             "chat_limit": "チャット",
             "daily_limit": "日次制限",
@@ -1642,7 +1659,19 @@ extension AppDelegate: NSMenuDelegate {
         statusGroup(submenu, acct: acct, width: width)
 
         // ─── Limit session group ───
-        limitSessionGroup(submenu, acct: acct, width: width, primaryLabel: "tier_usage")
+        if let windows = acct.usage_windows, !windows.isEmpty {
+            submenu.addItem(separatorRow(width: width))
+            submenu.addItem(groupHeaderItem(t("limit_session"), width: width))
+            for w in windows {
+                let groupLabel = w.group == "gemini" ? t("ag_group_gemini") : t("ag_group_other")
+                let windowKey = w.window == "weekly" ? "weekly_limit" : "5h_limit"
+                let pct = w.used_pct ?? 0
+                let line = "\(groupLabel) · " + L10n.usedLine(windowKey, String(format: "%.1f", pct), reset: w.reset)
+                submenu.addItem(infoItem(line, width: width, accentPercent: true, warnPercent: pct > 80))
+            }
+        } else {
+            limitSessionGroup(submenu, acct: acct, width: width, primaryLabel: "tier_usage")
+        }
     }
 
     func buildCopilotSubmenu(_ submenu: NSMenu, acct: Account, width: CGFloat) {

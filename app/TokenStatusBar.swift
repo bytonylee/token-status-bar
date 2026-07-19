@@ -7,6 +7,7 @@ struct StatusPayload: Codable {
     var generated_at: String
     var account_count: Int
     var heartbeat: HeartbeatSummary?
+    var headline: Headline?
     var accounts: [Account]
 }
 
@@ -100,6 +101,8 @@ struct Account: Codable, Identifiable {
     var tier_override: String?
     var heartbeat_last_success: String?
     var usage_windows: [UsageWindow]?
+    var windows: [WindowInfo]?
+    var live: LiveActivity?
 }
 
 struct ResetCredit: Codable {
@@ -115,6 +118,40 @@ struct UsageWindow: Codable {
     var window: String?
     var used_pct: Double?
     var reset: String?
+}
+
+struct WindowInfo: Codable {
+    var kind: String
+    var label: String?
+    var used_pct: Double?
+    var reset_at_epoch: Double?
+    var severity: String?
+    var is_active: Bool?
+    var source: String?
+    var as_of_epoch: Double?
+    var projected_exhaust_epoch: Double?
+}
+
+struct Headline: Codable {
+    var account_id: Int
+    var provider: String
+    var email: String?
+    var kind: String
+    var label: String?
+    var used_pct: Double
+    var reset_at_epoch: Double?
+    var severity: String
+}
+
+struct LiveActivity: Codable {
+    var provider: String?
+    var event_epoch: Double?
+    var last_total_tokens: Int?
+    var last_cached_tokens: Int?
+    var last_output_tokens: Int?
+    var context_used_pct: Double?
+    var tokens_60m: Int?
+    var as_of_epoch: Double?
 }
 
 // ─── Status Loader ────────────────────────────────────────────────────────
@@ -243,6 +280,16 @@ class StatusLoader: ObservableObject {
             DispatchQueue.main.async {
                 self.reload()
             }
+        }
+    }
+
+    func runDashboard() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Regenerates history/dashboard.html fresh; the backend's --open
+            // flag then opens it in the default browser.
+            let task = self.poolProcess(["dashboard", "--open"])
+            try? task.run()
+            task.waitUntilExit()
         }
     }
 
@@ -599,6 +646,81 @@ final class FixedMenuRowView: NSView {
     }
 }
 
+/// One thin usage gauge: [label | bar | pct · time-left].
+final class GaugeRowView: NSView {
+    private let info: WindowInfo
+    private let color: NSColor
+
+    init(window: WindowInfo, color: NSColor, width: CGFloat) {
+        self.info = window
+        self.color = color
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 16))
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    private func kindLabel() -> String {
+        if info.kind == "model_weekly" { return info.label ?? "model" }
+        if let label = info.label, info.kind == "monthly" { return label }
+        return info.kind
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let pct = max(0, min(100, info.used_pct ?? 0))
+        let labelX: CGFloat = 28
+        let labelW: CGFloat = 62
+        let rightW: CGFloat = 96
+        let barX = labelX + labelW + 6
+        let barW = bounds.width - barX - rightW - 16
+        let attrsLabel: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10.5),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+        (kindLabel() as NSString).draw(
+            at: NSPoint(x: labelX, y: 2), withAttributes: attrsLabel)
+
+        let track = NSRect(x: barX, y: 5.5, width: barW, height: 5)
+        NSColor.quaternaryLabelColor.setFill()
+        NSBezierPath(roundedRect: track, xRadius: 2.5, yRadius: 2.5).fill()
+        if pct > 0 {
+            let fill = NSRect(x: barX, y: 5.5, width: barW * pct / 100.0, height: 5)
+            color.setFill()
+            NSBezierPath(roundedRect: fill, xRadius: 2.5, yRadius: 2.5).fill()
+        }
+
+        var right = "\(Int(pct.rounded()))%"
+        if let left = AppDelegate.timeLeft(info.reset_at_epoch) { right += " · \(left)" }
+        let attrsRight: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+        let size = (right as NSString).size(withAttributes: attrsRight)
+        (right as NSString).draw(
+            at: NSPoint(x: bounds.width - 16 - size.width, y: 2),
+            withAttributes: attrsRight)
+    }
+}
+
+/// Account row + its gauge bars stacked into one menu-item view.
+final class AccountRowWithGauges: NSView {
+    init(row: FixedMenuRowView, gauges: [GaugeRowView], width: CGFloat) {
+        let gaugeH: CGFloat = 16
+        let pad: CGFloat = gauges.isEmpty ? 0 : 4
+        let height = MenuRowLayout.standardHeight + CGFloat(gauges.count) * gaugeH + pad
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        row.setFrameOrigin(NSPoint(x: 0, y: height - MenuRowLayout.standardHeight))
+        addSubview(row)
+        for (i, g) in gauges.enumerated() {
+            g.setFrameOrigin(NSPoint(x: 0, y: CGFloat(gauges.count - 1 - i) * gaugeH + 2))
+            g.setFrameSize(NSSize(width: width, height: gaugeH))
+            addSubview(g)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+}
+
 // ─── Language Mode ─────────────────────────────────────────────────────────
 enum Language: String, CaseIterable {
     case en, ko, zh, ja
@@ -631,6 +753,7 @@ enum L10n {
         .en: [
             // ── Footer ──
             "poll_now": "Poll Now",
+            "open_dashboard": "Open Dashboard",
             "refresh_display": "Refresh Display",
             "add_new_agent": "Add New Agent",
             "language": "Language",
@@ -742,6 +865,7 @@ enum L10n {
         .ko: [
             // ── Footer ──
             "poll_now": "지금 업데이트",
+            "open_dashboard": "대시보드 열기",
             "refresh_display": "표시 새로고침",
             "add_new_agent": "새 에이전트 추가",
             "language": "언어",
@@ -853,6 +977,7 @@ enum L10n {
         .zh: [
             // ── Footer ──
             "poll_now": "立即轮询",
+            "open_dashboard": "打开仪表盘",
             "refresh_display": "刷新显示",
             "add_new_agent": "添加新代理",
             "language": "语言",
@@ -964,6 +1089,7 @@ enum L10n {
         .ja: [
             // ── Footer ──
             "poll_now": "今すぐポーリング",
+            "open_dashboard": "ダッシュボードを開く",
             "refresh_display": "表示を更新",
             "add_new_agent": "新しいエージェントを追加",
             "language": "言語",
@@ -1134,6 +1260,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
     }
 
+    private func windowRiskColor(pct: Double, severity: String?, projected: Bool) -> NSColor {
+        if projected || pct > 80 || (severity ?? "normal") != "normal" { return .systemRed }
+        if pct >= 50 { return .systemYellow }
+        return .systemGreen
+    }
+
+    static func timeLeft(_ epoch: Double?) -> String? {
+        guard let epoch else { return nil }
+        let s = Int(epoch - Date().timeIntervalSince1970)
+        if s <= 0 { return nil }
+        if s < 3600 { return "\(s / 60)m" }
+        if s < 86400 { return "\(s / 3600)h\((s % 3600) / 60)m" }
+        return String(format: "%.1fd", Double(s) / 86400.0)
+    }
+
+    private func headlineTitle() -> NSAttributedString? {
+        guard let h = loader.payload?.headline else { return nil }
+        var text = " \(Int(h.used_pct.rounded()))%"
+        if let left = AppDelegate.timeLeft(h.reset_at_epoch) { text += " · \(left)" }
+        let color = windowRiskColor(pct: h.used_pct, severity: h.severity, projected: false)
+        return NSAttributedString(string: text, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: color,
+            .baselineOffset: 0.5,
+        ])
+    }
+
     /// Pool-wide health shown as the icon's corner dot.
     private func poolDotColor() -> NSColor {
         guard let payload = loader.payload else { return .systemOrange }
@@ -1179,6 +1332,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         image.isTemplate = false
         image.accessibilityDescription = "Agent Pool"
         button.image = image
+        if let title = headlineTitle() {
+            button.attributedTitle = title
+            button.imagePosition = .imageLeft
+        } else {
+            button.attributedTitle = NSAttributedString(string: "")
+            button.imagePosition = .imageOnly
+        }
     }
 
     @objc func quitApp() {
@@ -1221,6 +1381,27 @@ extension AppDelegate: NSMenuDelegate {
             for acct in accts {
                 menu.addItem(accountItem(acct))
             }
+            menu.addItem(separatorRow())
+        }
+
+        // Live ticker: freshest local session activity across accounts.
+        let fresh = payload.accounts.compactMap { a -> (Account, LiveActivity, Double)? in
+            guard let live = a.live, let ts = live.as_of_epoch ?? live.event_epoch,
+                  Date().timeIntervalSince1970 - ts < 600 else { return nil }
+            return (a, live, ts)
+        }.max(by: { $0.2 < $1.2 })
+        if let (acct, live, _) = fresh {
+            var parts: [String] = [providerDisplayName(acct.provider)]
+            if let tokens = live.last_total_tokens {
+                parts.append("+\(tokens.formatted()) tok")
+            }
+            if let ctx = live.context_used_pct {
+                parts.append("context \(Int(ctx.rounded()))%")
+            }
+            if let t60 = live.tokens_60m, live.last_total_tokens == nil {
+                parts.append("\(t60.formatted()) tok/60m")
+            }
+            menu.addItem(infoItem("⚡︎ " + parts.joined(separator: " · ")))
             menu.addItem(separatorRow())
         }
 
@@ -1329,6 +1510,13 @@ extension AppDelegate: NSMenuDelegate {
                 submenu.addItem(infoItem(line, width: detailWidth))
             }
         }
+        for w in acct.windows ?? [] {
+            guard let exhaust = w.projected_exhaust_epoch,
+                  let left = AppDelegate.timeLeft(exhaust) else { continue }
+            let name = w.kind == "model_weekly" ? (w.label ?? "model") : w.kind
+            submenu.addItem(warningItem("⚠︎ \(name): exhausts in ~\(left) at current pace",
+                                        width: detailWidth))
+        }
         submenu.addItem(separatorRow(width: detailWidth))
         addHeartbeatStatus(submenu, acct: acct, width: detailWidth)
         if acct.heartbeat_status != nil || acct.heartbeat_next != nil || acct.heartbeat_last != nil {
@@ -1340,10 +1528,19 @@ extension AppDelegate: NSMenuDelegate {
         submenu.addItem(actionItem(t("delete_agent"), width: detailWidth, destructive: true) { [weak self] in
             self?.loader.confirmDeleteAgent(acct: acct)
         })
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         item.submenu = submenu
-        item.view = FixedMenuRowView(title: title, style: .submenu, submenu: submenu,
-                                     dotColor: statusColor(acct.status), badge: endSoonBadge(acct))
+        let row = FixedMenuRowView(title: title, style: .submenu, submenu: submenu,
+                                   dotColor: statusColor(acct.status), badge: endSoonBadge(acct))
+        let gauges = (acct.windows ?? []).prefix(3).map { w in
+            GaugeRowView(window: w,
+                         color: windowRiskColor(pct: w.used_pct ?? 0,
+                                                severity: w.severity,
+                                                projected: w.projected_exhaust_epoch != nil),
+                         width: MenuRowLayout.width)
+        }
+        item.view = AccountRowWithGauges(row: row, gauges: Array(gauges),
+                                         width: MenuRowLayout.width)
         return item
     }
 
@@ -1832,6 +2029,7 @@ extension AppDelegate: NSMenuDelegate {
 
     func addFooter(_ menu: NSMenu) {
         menu.addItem(actionItem(t("poll_now")) { [weak self] in self?.loader.runPoll() })
+        menu.addItem(actionItem(t("open_dashboard")) { [weak self] in self?.loader.runDashboard() })
         menu.addItem(actionItem(t("refresh_display")) { [weak self] in self?.loader.reload() })
         menu.addItem(submenuRow(t("add_new_agent"), submenu: addAgentSubmenu()))
         menu.addItem(submenuRow(t("language"), submenu: languageSubmenu()))
@@ -1889,29 +2087,32 @@ extension AppDelegate: NSMenuDelegate {
     }
 
     // ─── Row builders ─────────────────────────────────────────────────────
+    // NSMenuItems get an empty title: the fixed-width view carries the text,
+    // and a non-empty title would also feed NSMenu's width calculation,
+    // widening the menu past the views when the string is long.
     func titleItem(_ title: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         item.isEnabled = false
         item.view = FixedMenuRowView(title: title, style: .title, accentNumbers: true)
         return item
     }
 
     func headerItem(_ title: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         item.isEnabled = false
         item.view = FixedMenuRowView(title: title, style: .header)
         return item
     }
 
     func groupHeaderItem(_ title: String, width: CGFloat = MenuRowLayout.width) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         item.isEnabled = false
         item.view = FixedMenuRowView(title: title, style: .groupHeader, width: width)
         return item
     }
 
     func bulletItem(_ title: String, width: CGFloat = MenuRowLayout.width) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         item.isEnabled = false
         item.view = FixedMenuRowView(title: title, style: .bullet, width: width)
         return item
@@ -1920,7 +2121,7 @@ extension AppDelegate: NSMenuDelegate {
     func infoItem(_ title: String, width: CGFloat = MenuRowLayout.width,
                   accentPercent: Bool = false, warnPercent: Bool = false,
                   accentResetTime: Bool = false) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         item.isEnabled = false
         item.view = FixedMenuRowView(title: title, style: .info, accentPercent: accentPercent,
                                      warnPercent: warnPercent, accentResetTime: accentResetTime, width: width)
@@ -1928,7 +2129,7 @@ extension AppDelegate: NSMenuDelegate {
     }
 
     func warningItem(_ title: String, width: CGFloat = MenuRowLayout.width) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         item.isEnabled = false
         item.view = FixedMenuRowView(title: title, style: .warning, width: width)
         return item
@@ -2011,7 +2212,7 @@ extension AppDelegate: NSMenuDelegate {
     func actionItem(_ title: String, width: CGFloat = MenuRowLayout.width,
                     checkmark: Bool = false, destructive: Bool = false,
                     action: @escaping () -> Void) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         item.view = FixedMenuRowView(title: title, style: .action, action: action,
                                      checkmark: checkmark, destructive: destructive, width: width)
         return item
@@ -2019,7 +2220,7 @@ extension AppDelegate: NSMenuDelegate {
 
     func submenuRow(_ title: String, submenu: NSMenu, width: CGFloat = MenuRowLayout.width,
                     dotColor: NSColor? = nil, badge: String? = nil) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         item.submenu = submenu
         item.view = FixedMenuRowView(title: title, style: .submenu, submenu: submenu,
                                      dotColor: dotColor, badge: badge, width: width)

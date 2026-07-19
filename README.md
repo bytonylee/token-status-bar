@@ -112,7 +112,7 @@ flowchart TD
     P --> Q[parse remaining % + reset]
     Q --> R[(pool.db snapshot)]
     R --> S[status.json]
-    S --> T["MenuBarAgent.app<br/>reads every 30s"]
+    S --> T["TokenStatusBar.app<br/>reads every 30s"]
     T --> U[menu bar dropdown + dots]
 ```
 
@@ -150,7 +150,7 @@ flowchart TD
     K --> L[store.save_snapshot]
     L --> I
     I --> M[status.cmd_export → status.json]
-    M --> N["MenuBarAgent.app reads every 30s → dropdown UI + dots"]
+    M --> N["TokenStatusBar.app reads every 30s → dropdown UI + dots"]
 ```
 
 ## Requirements
@@ -163,8 +163,8 @@ flowchart TD
 
 | Path                 | Purpose |
 |----------------------|---------|
-| `app/MenuBarAgent.swift` | Single-file Swift menu-bar UI. |
-| `build-app.sh`       | Compiles and bundles `MenuBarAgent.app`. |
+| `app/TokenStatusBar.swift` | Single-file Swift menu-bar UI. |
+| `build.sh`           | Compiles and bundles `TokenStatusBar.app`. |
 | `backend/pool.py`    | CLI: onboarding, polling, status export. |
 | `backend/poller.py`  | Per-provider real-time quota polling. |
 | `backend/status.py`  | Writes `status.json` for the app to read. |
@@ -180,8 +180,8 @@ environment variables.
 ## Build & run the app
 
 ```bash
-./build-app.sh
-open MenuBarAgent.app
+./build.sh
+open /Applications/TokenStatusBar.app
 ```
 
 The app reads `status.json` every 30 seconds and shows a chart icon in the menu

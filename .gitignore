@@ -2,6 +2,7 @@
 # All secrets / local runtime data live in secrets/ (db, status.json, logs)
 secrets/
 /pool.db
+history/
 *.log
 
 # ─── Build artifacts ──────────────────────────────────────────────────

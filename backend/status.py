@@ -284,7 +284,27 @@ def claude_extra(snap) -> dict:
         out["member_since"] = iso_fmt(prof.get("member_since"))
         out["display_name"] = prof.get("display_name")
         out["org_name"] = prof.get("org_name")
-    if rl:
+    usage = rj.get("usage_api") or {}
+    limits = [l for l in (usage.get("limits") or []) if isinstance(l, dict)]
+    if limits:
+        by_kind = {l.get("kind"): l for l in limits}
+        if by_kind.get("session"):
+            out["primary_status"] = by_kind["session"].get("severity")
+        if by_kind.get("weekly_all"):
+            out["secondary_status"] = by_kind["weekly_all"].get("severity")
+        active = next((l for l in limits if l.get("is_active")), None)
+        if active:
+            label = {"session": "5h", "weekly_all": "weekly"}.get(active.get("kind"))
+            if label is None:
+                scope_model = ((active.get("scope") or {}).get("model") or {})
+                label = scope_model.get("display_name") or active.get("kind")
+            out["binding_window"] = label
+        extra = usage.get("extra_usage") or {}
+        if extra.get("is_enabled"):
+            out["extra_usage_enabled"] = True
+            if extra.get("utilization") is not None:
+                out["extra_usage_used_pct"] = float(extra["utilization"])
+    elif rl:
         out["primary_status"] = rl.get("anthropic-ratelimit-unified-5h-status")
         out["secondary_status"] = rl.get("anthropic-ratelimit-unified-7d-status")
         fallback_pct = rl.get("anthropic-ratelimit-unified-fallback-percentage")
@@ -358,6 +378,206 @@ def provider_extra(provider, snap) -> dict:
         out["plan_start"] = ts_fmt(extra.get("plan_start_unix")) if extra.get("plan_start_unix") else None
         out["plan_reset"] = ts_fmt(extra.get("plan_reset_unix")) if extra.get("plan_reset_unix") else None
     return {k: v for k, v in out.items() if v is not None}
+
+
+# ─── unified window model ───────────────────────────────────────────────────
+def _kind_from_window_s(window_s, default):
+    if not window_s:
+        return default
+    if 17000 <= window_s <= 19000:
+        return "5h"
+    if window_s == 86400:
+        return "daily"
+    if 500000 <= window_s < 1000000:
+        return "weekly"
+    if window_s >= 1000000:
+        return "monthly"
+    return default
+
+
+def _win(kind, label, used, reset_epoch, *, severity=None, is_active=None,
+         source="api", as_of=None):
+    if used is None:
+        return None
+    try:
+        used = float(used)
+    except (TypeError, ValueError):
+        return None
+    try:
+        reset_epoch = float(reset_epoch) if reset_epoch is not None else None
+    except (TypeError, ValueError):
+        reset_epoch = None
+    return {"kind": kind, "label": label, "used_pct": round(used, 2),
+            "reset_at_epoch": reset_epoch, "severity": severity or "normal",
+            "is_active": is_active, "source": source, "as_of_epoch": as_of}
+
+
+def _pct(v):
+    """float(v), or None when the value is missing or non-numeric."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _snap_raw(snap) -> dict:
+    try:
+        rj = json.loads(snap.get("raw_json") or "{}")
+    except Exception:
+        return {}
+    return rj if isinstance(rj, dict) else {}
+
+
+def normalize_windows(provider, snap) -> list[dict]:
+    """Reduce one snapshot to the unified windows[] model (pure function)."""
+    if not snap or snap.get("status") not in ("active", "rate_limited"):
+        return []
+    as_of = float(snap["ts"]) if snap.get("ts") else None
+    src = snap.get("source") or "api"
+    rj = _snap_raw(snap)
+    out = []
+
+    def add(w):
+        if w:
+            out.append(w)
+
+    if provider in ("codex", "claude"):
+        sev_active = {}
+        if provider == "claude":
+            for lim in (rj.get("usage_api") or {}).get("limits") or []:
+                if isinstance(lim, dict):
+                    sev_active[lim.get("kind")] = (lim.get("severity"),
+                                                   lim.get("is_active"))
+        s5, a5 = sev_active.get("session", (None, None))
+        sw, aw = sev_active.get("weekly_all", (None, None))
+        add(_win(_kind_from_window_s(snap.get("primary_window_s"), "5h"), None,
+                 snap.get("primary_used_pct"), snap.get("primary_reset_at"),
+                 severity=s5, is_active=a5, source=src, as_of=as_of))
+        add(_win(_kind_from_window_s(snap.get("secondary_window_s"), "weekly"), None,
+                 snap.get("secondary_used_pct"), snap.get("secondary_reset_at"),
+                 severity=sw, is_active=aw, source=src, as_of=as_of))
+        fable = rj.get("fable") or {}
+        if fable.get("used_pct") is not None:
+            add(_win("model_weekly", fable.get("label"), fable["used_pct"],
+                     fable.get("reset_at"), severity=fable.get("status"),
+                     source=src, as_of=as_of))
+    elif provider == "xai":
+        reset = None
+        end = snap.get("monthly_period_end")
+        if end:
+            dt = _parse_iso(end)
+            reset = dt.timestamp() if dt else None
+        add(_win("monthly", "credits", snap.get("monthly_used_pct"), reset,
+                 source=src, as_of=as_of))
+        if snap.get("secondary_window_s") == 86400:
+            add(_win("daily", None, snap.get("secondary_used_pct"),
+                     snap.get("secondary_reset_at"), source=src, as_of=as_of))
+    elif provider == "copilot":
+        add(_win("monthly", "premium", snap.get("primary_used_pct"),
+                 snap.get("primary_reset_at"), source=src, as_of=as_of))
+        add(_win("monthly", "chat", snap.get("secondary_used_pct"),
+                 snap.get("primary_reset_at"), source=src, as_of=as_of))
+    elif provider == "devin":
+        daily_rem = _pct(snap.get("daily_quota_remaining_percent"))
+        if daily_rem is not None:
+            add(_win("daily", None, 100.0 - daily_rem,
+                     snap.get("primary_reset_at"), source=src, as_of=as_of))
+        weekly_rem = _pct(snap.get("weekly_quota_remaining_percent"))
+        if weekly_rem is not None:
+            add(_win("weekly", None, 100.0 - weekly_rem,
+                     snap.get("secondary_reset_at"), source=src, as_of=as_of))
+    elif provider == "antigravity":
+        label = None
+        rem = snap.get("rate_limit_remaining") or ""
+        m = re.search(r"\(([^)]+)\)", rem)
+        if m:
+            label = m.group(1)
+        add(_win("model_weekly", label, snap.get("primary_used_pct"),
+                 snap.get("primary_reset_at"), source=src, as_of=as_of))
+        for w in (rj.get("extra") or {}).get("usage_windows") or []:
+            if not isinstance(w, dict):
+                continue
+            rem_pct = _pct(w.get("remaining_pct"))
+            if rem_pct is None:
+                continue
+            kind = "weekly" if w.get("window") == "weekly" else "5h"
+            add(_win(kind, w.get("group"),
+                     max(0.0, min(100.0, 100.0 - rem_pct)),
+                     w.get("reset_at"), source=src, as_of=as_of))
+    return out
+
+
+def select_headline(items) -> dict | None:
+    """The single riskiest window across all accounts, for the menu bar title."""
+    now_ts = time.time()
+    best, best_key = None, None
+    for it in items:
+        for w in it.get("windows") or []:
+            if w.get("used_pct") is None:
+                continue
+            reset = w.get("reset_at_epoch")
+            if reset and reset < now_ts:
+                continue
+            sev = 0 if (w.get("severity") or "normal") == "normal" else 1
+            proj = 1 if w.get("projected_exhaust_epoch") else 0
+            key = (sev, proj, w["used_pct"], -(reset or 1e18))
+            if best_key is None or key > best_key:
+                best_key = key
+                best = {"account_id": it["id"], "provider": it["provider"],
+                        "email": it.get("email"), "kind": w["kind"],
+                        "label": w.get("label"), "used_pct": w["used_pct"],
+                        "reset_at_epoch": reset, "severity": w.get("severity") or "normal"}
+    return best
+
+
+BURN_LOOKBACK_S = 3600
+BURN_MIN_POINTS = 3
+BURN_RESET_DROP_PCT = 5.0
+
+
+def project_exhaust(points, reset_at, now) -> float | None:
+    """Epoch when used% hits 100 at the trailing pace, if before reset_at.
+
+    points: (ts, used_pct) oldest first. A drop > BURN_RESET_DROP_PCT marks a
+    reset — only the segment after the most recent reset is used.
+    """
+    if not reset_at:
+        return None
+    segment = []
+    for ts, used in points:
+        if segment and used < segment[-1][1] - BURN_RESET_DROP_PCT:
+            segment = []
+        segment.append((ts, used))
+    if len(segment) < BURN_MIN_POINTS:
+        return None
+    (t0, u0), (t1, u1) = segment[0], segment[-1]
+    if t1 <= t0 or u1 <= u0:
+        return None
+    rate = (u1 - u0) / (t1 - t0)  # pct per second
+    exhaust = t1 + (100.0 - u1) / rate
+    return exhaust if exhaust < reset_at else None
+
+
+def attach_projections(conn, account, windows, now=None):
+    """Set projected_exhaust_epoch on windows exhausting before their reset."""
+    now = now or time.time()
+    future = [w for w in windows
+              if w.get("reset_at_epoch") and w["reset_at_epoch"] > now]
+    if not future:
+        return
+    history = store.snapshots_since(conn, account["id"], now - BURN_LOOKBACK_S)
+    if len(history) < BURN_MIN_POINTS:
+        return
+    series: dict = {}
+    for s in history:
+        for w in normalize_windows(account["provider"], s):
+            key = (w["kind"], w.get("label"))
+            series.setdefault(key, []).append((float(s["ts"]), w["used_pct"]))
+    for w in future:
+        pts = series.get((w["kind"], w.get("label"))) or []
+        exhaust = project_exhaust(pts, w["reset_at_epoch"], now)
+        if exhaust:
+            w["projected_exhaust_epoch"] = exhaust
 
 
 def codex_extra(conn, account_id) -> dict:
@@ -495,10 +715,17 @@ def cmd_export(conn) -> int:
         name, price = plan_label(a["provider"], items[-1]["plan"], items[-1])
         items[-1]["plan"] = name
         items[-1]["plan_price"] = price
+        items[-1]["windows"] = normalize_windows(a["provider"], snap)
+        attach_projections(conn, a, items[-1]["windows"])
+        live = store.get_live_activity(conn, a["id"])
+        if live and (time.time() - float(live.get("ts", 0))) < 600:
+            live["as_of_epoch"] = float(live.pop("ts"))
+            items[-1]["live"] = live
     payload = {
         "generated_at": datetime.datetime.now().isoformat(),
         "account_count": len(items),
         "heartbeat": heartbeat_summary(items),
+        "headline": select_headline(items),
         "accounts": items,
     }
     STATUS_JSON.parent.mkdir(parents=True, exist_ok=True)

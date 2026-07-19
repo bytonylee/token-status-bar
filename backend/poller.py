@@ -1,8 +1,9 @@
-"""Poller — hits limit endpoints for every account every 5 minutes.
+"""Poller — hits limit endpoints for every account (adaptive: 300s base,
+60s hot / 180s hot-claude, pre-reset capture near known boundaries).
 
 Limit sources:
   codex:        chatgpt.com/backend-api/wham/usage + /wham/rate-limit-reset-credits
-  claude:       console.anthropic.com/v1/messages probe (x-ratelimit-* headers)
+  claude:       api.anthropic.com/api/oauth/usage (five_hour/seven_day/limits[])
   xai:          cli-chat-proxy.grok.com/v1/billing (monthly credits) + api.x.ai chat headers (daily)
   antigravity:  cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels (per-model remainingFraction)
   copilot:      api.github.com/copilot_internal/user (quota_snapshots.premium_interactions)
@@ -10,10 +11,21 @@ Limit sources:
 """
 from __future__ import annotations
 import json, os, re, sys, time, datetime, urllib.request, urllib.error
-import store, oauth, work_queue
+import store, oauth, window_history, work_queue
 
 WHAM = "https://chatgpt.com/backend-api"
 POLL_INTERVAL = int(os.environ.get("AGENT_POOL_POLL_INTERVAL", "300"))  # 5 min
+LOCAL_SYNC_INTERVAL_S = int(os.environ.get("LOCAL_SYNC_INTERVAL_S", "15"))
+
+# Adaptive cadence: hot accounts (any window >= HOT_THRESHOLD_PCT used) poll
+# faster — an early reset only destroys meaningful data when usage is high —
+# and accounts within PRERESET_LEAD_S of a known reset get a fresh capture
+# with retries.
+HOT_THRESHOLD_PCT = float(os.environ.get("HOT_THRESHOLD_PCT", "70"))
+HOT_INTERVAL_S = int(os.environ.get("HOT_INTERVAL_S", "60"))
+PRERESET_LEAD_S = int(os.environ.get("PRERESET_LEAD_S", "300"))
+PRERESET_RETRY_S = int(os.environ.get("PRERESET_RETRY_S", "60"))
+PRERESET_FINAL_GAP_S = 30
 
 # IDE headers required for copilot_internal/user to return quota_snapshots.
 COPILOT_IDE_HEADERS = {
@@ -102,7 +114,9 @@ def poll_codex(conn, account, token):
     # reset credits detail
     st2, credits, _ = _get(f"{WHAM}/wham/rate-limit-reset-credits", headers)
     if st2 == 200 and isinstance(credits, dict):
-        store.replace_reset_credits(conn, account["id"], credits.get("credits") or [])
+        credit_list = credits.get("credits") or []
+        store.replace_reset_credits(conn, account["id"], credit_list)
+        store.upsert_credit_history(conn, account["id"], credit_list)
     _sync_codex_subscription_meta(conn, account, headers)
     store.log_event(conn, account["id"], "limit_poll", True, "")
 
@@ -158,62 +172,87 @@ def _sync_codex_subscription_meta(conn, account, headers):
     )
 
 
-# ─── Claude headers ────────────────────────────────────────────────────────
+# ─── Claude oauth/usage ────────────────────────────────────────────────────
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
 def poll_claude(conn, account, token):
-    # Minimal 1-token messages call to read rate-limit headers
-    # Claude returns: anthropic-ratelimit-unified-5h-utilization (0.07 = 7%)
-    #                 anthropic-ratelimit-unified-5h-reset (epoch)
-    #                 anthropic-ratelimit-unified-7d-utilization, -7d-reset
-    body = json.dumps({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "hi"}],
-    }).encode()
-    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Authorization", f"Bearer {token['access_token']}")
-    req.add_header("anthropic-version", "2023-06-01")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            hdrs = dict(r.headers)
-            snap = _claude_snap(hdrs, "active", "")
-    except urllib.error.HTTPError as e:
-        hdrs = dict(e.headers)
-        msg = e.read().decode(errors="replace")[:120]
-        snap = _claude_snap(hdrs, "error" if e.code != 429 else "rate_limited",
-                            f"HTTP {e.code}: {msg}")
-    except urllib.error.URLError as e:
-        snap = {"status": "error", "status_message": str(e.reason)}
-    # Enrich with subscription profile (best-effort, never fails the poll)
-    profile = _claude_profile(token)
+    """Poll Claude via the quota-free oauth/usage endpoint (no probes)."""
+    def _fetch(access_token):
+        return _get(CLAUDE_USAGE_URL, {
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+        })
+
+    st, body, _ = _fetch(token["access_token"])
+    if st == 401 and token.get("refresh_token"):
+        # One refresh + retry; a second 401 becomes an error snapshot.
+        try:
+            result = oauth.refresh_claude(token["refresh_token"])
+            store.save_token(conn, account["id"], result["access_token"],
+                             result.get("refresh_token"), result.get("id_token"),
+                             result.get("expires_at"), result.get("raw"))
+            store.log_event(conn, account["id"], "token_refresh", True, "")
+            token = store.get_token(conn, account["id"])
+            st, body, _ = _fetch(token["access_token"])
+        except Exception as e:
+            store.log_event(conn, account["id"], "token_refresh", False, str(e))
+
+    if st != 200 or not isinstance(body, dict):
+        snap = {"status": "error",
+                "status_message": f"oauth/usage HTTP {st}: {str(body)[:120]}"}
+    else:
+        snap = _claude_usage_snap(body, _claude_profile(token))
+    store.save_snapshot(conn, account["id"], snap)
+    store.log_event(conn, account["id"], "limit_poll", snap["status"] == "active",
+                    snap.get("status_message", ""))
+
+
+def _claude_usage_snap(body, profile):
+    """Build a snapshot from the oauth/usage response body (pure function)."""
+    snap = {"status": "active", "status_message": ""}
+    rj = {"usage_api": body}
     if profile:
+        rj["profile"] = profile
         if profile.get("plan"):
             snap["plan"] = profile["plan"]
-        try:
-            rj = json.loads(snap.get("raw_json") or "{}")
-        except Exception:
-            rj = {}
-        if not isinstance(rj, dict):
-            rj = {}
-        rj["profile"] = profile
-        snap["raw_json"] = json.dumps(rj)
-    # Step 2: probe claude-fable-5 to read its model-scoped weekly window
-    # (anthropic-ratelimit-unified-7d_oi-*), the separate "Fable" weekly limit
-    # shown in Claude's usage UI. These headers only appear on responses to
-    # requests for that model tier, so an active probe is required. Best-effort:
-    # a failed/missing probe leaves the fable window empty without failing poll.
-    fable = _claude_fable_window(token)
-    if fable:
-        try:
-            rj = json.loads(snap.get("raw_json") or "{}")
-        except Exception:
-            rj = {}
-        if not isinstance(rj, dict):
-            rj = {}
-        rj["fable"] = fable
-        snap["raw_json"] = json.dumps(rj)
-    store.save_snapshot(conn, account["id"], snap)
-    store.log_event(conn, account["id"], "limit_poll", snap["status"] == "active", snap.get("status_message", ""))
+
+    fh = body.get("five_hour") or {}
+    if fh.get("utilization") is not None:
+        snap["primary_used_pct"] = float(fh["utilization"])
+        snap["primary_window_s"] = 18000
+        reset = window_history._parse_iso_ts(fh.get("resets_at"))
+        if reset:
+            snap["primary_reset_at"] = reset
+    sd = body.get("seven_day") or {}
+    if sd.get("utilization") is not None:
+        snap["secondary_used_pct"] = float(sd["utilization"])
+        snap["secondary_window_s"] = 604800
+        reset = window_history._parse_iso_ts(sd.get("resets_at"))
+        if reset:
+            snap["secondary_reset_at"] = reset
+
+    limits = [l for l in (body.get("limits") or []) if isinstance(l, dict)]
+    for lim in limits:
+        if lim.get("kind") != "weekly_scoped":
+            continue
+        scope_model = ((lim.get("scope") or {}).get("model") or {})
+        rj["fable"] = {
+            "label": scope_model.get("display_name") or "scoped",
+            "used_pct": float(lim["percent"]) if lim.get("percent") is not None else None,
+            "reset_at": window_history._parse_iso_ts(lim.get("resets_at")),
+            "status": lim.get("severity"),
+        }
+        break
+
+    active = next((l for l in limits if l.get("is_active")), None)
+    snap["rate_limit_remaining"] = (active or {}).get("severity") or "normal"
+    snap["rate_limit_limit"] = "unified"
+    if snap.get("primary_reset_at"):
+        snap["rate_limit_reset"] = str(snap["primary_reset_at"])
+    snap["raw_json"] = json.dumps(rj)
+    return snap
 
 
 def _claude_profile(token):
@@ -249,96 +288,6 @@ def _claude_profile(token):
         "org_name": org.get("name"),
         "member_since": acct.get("created_at"),
     }
-
-
-def _claude_snap(hdrs, status, msg):
-    raw = {k: v for k, v in hdrs.items() if "ratelimit" in k.lower()}
-    snap = {"status": status, "status_message": msg, "raw_json": json.dumps({"ratelimit": raw})}
-    # 5h window
-    util_5h = hdrs.get("anthropic-ratelimit-unified-5h-utilization")
-    reset_5h = hdrs.get("anthropic-ratelimit-unified-5h-reset")
-    if util_5h is not None:
-        snap["primary_used_pct"] = float(util_5h) * 100
-    if reset_5h:
-        snap["primary_reset_at"] = float(reset_5h)
-        snap["primary_window_s"] = 18000  # 5h
-    # 7d window
-    util_7d = hdrs.get("anthropic-ratelimit-unified-7d-utilization")
-    reset_7d = hdrs.get("anthropic-ratelimit-unified-7d-reset")
-    if util_7d is not None:
-        snap["secondary_used_pct"] = float(util_7d) * 100
-    if reset_7d:
-        snap["secondary_reset_at"] = float(reset_7d)
-        snap["secondary_window_s"] = 604800  # 7d
-    # Generic fields for display
-    snap["rate_limit_remaining"] = hdrs.get("anthropic-ratelimit-unified-status")
-    snap["rate_limit_reset"] = reset_5h
-    snap["rate_limit_limit"] = "unified"
-    return snap
-
-
-def _claude_fable_window(token):
-    """Probe claude-fable-5 to read its model-scoped weekly rate-limit window.
-
-    Claude exposes a separate weekly limit for the top model tier ("Fable" in
-    the usage UI) via headers shaped anthropic-ratelimit-unified-<window>-*
-    where <window> is e.g. 7d_oi. These only appear on responses to requests
-    for that model tier, so we send a 1-token Claude Code-shaped probe.
-    Matched generically so a renamed or newly added 7d_<label> window is
-    picked up as-is. Best-effort: returns None on any failure so the main poll
-    stays green.
-    """
-    body = json.dumps({
-        "model": "claude-fable-5",
-        "max_tokens": 1,
-        "system": "You are Claude Code, Anthropic's official CLI for Claude.",
-        "messages": [{"role": "user", "content": "hi"}],
-    }).encode()
-    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Authorization", f"Bearer {token['access_token']}")
-    req.add_header("anthropic-version", "2023-06-01")
-    req.add_header("anthropic-beta", "oauth-2025-04-20")
-    hdrs = None
-    http_code = None
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            hdrs = dict(r.headers)
-    except urllib.error.HTTPError as e:
-        # Rate-limit headers (incl. the 7d_oi Fable window) are often attached
-        # to 429/error responses too — read them so a throttled probe still
-        # reports the Fable weekly utilization.
-        hdrs = dict(e.headers)
-        http_code = e.code
-    except urllib.error.URLError:
-        return None
-    win = None
-    for key, val in hdrs.items():
-        m = re.match(r"^anthropic-ratelimit-unified-(7d_[a-z0-9_]+)-(utilization|reset|status)$",
-                     key, re.IGNORECASE)
-        if not m:
-            continue
-        label, field = m.group(1), m.group(2)
-        if win is None:
-            win = {"label": label, "used_pct": None, "reset_at": None, "status": None}
-        if field == "utilization":
-            try:
-                win["used_pct"] = float(val) * 100
-            except (TypeError, ValueError):
-                pass
-        elif field == "reset":
-            try:
-                win["reset_at"] = float(val)
-            except (TypeError, ValueError):
-                pass
-        else:
-            win["status"] = val
-    # No 7d_<label> headers but a 429 means the Fable tier is rate-limited (or
-    # not yet provisioned) — record the state so the UI can surface a Fable row
-    # instead of silently omitting it.
-    if win is None and http_code == 429:
-        win = {"label": None, "used_pct": None, "reset_at": None, "status": "rate_limited"}
-    return win
 
 
 # ─── xAI headers ───────────────────────────────────────────────────────────
@@ -1004,11 +953,13 @@ def _refresh_if_needed(conn, account, token):
     return token
 
 
-def poll_account(conn, account) -> bool:
-    """Poll a single account and refresh status.json. Returns True on success.
+def _poll_one(conn, account) -> bool:
+    """Poll one account. Returns True when the provider poll succeeded.
 
-    Used by onboarding so a freshly-added account immediately has subscription
-    data instead of waiting for the next 5-minute poll cycle.
+    Wraps the provider poller with closed-window detection: the previous
+    successful snapshot is captured before the poll and compared with the
+    freshly saved one right after, archiving any windows that closed in
+    between. Detection failures never fail the poll.
     """
     token = store.get_token(conn, account["id"])
     if not token:
@@ -1020,6 +971,15 @@ def poll_account(conn, account) -> bool:
         store.save_snapshot(conn, account["id"],
                             {"status": "error", "status_message": f"no poller for {account['provider']}"})
         return False
+    # Capturing the baseline for detection must never fail the poll; on any
+    # error skip detection (prev=None, no coupon hint) and poll anyway.
+    try:
+        prev = store.latest_successful_snapshot(conn, account["id"])
+        prev_credits = ({c["credit_id"]: c["status"] for c in store.list_reset_credits(conn, account["id"])}
+                        if account["provider"] == "codex" else {})
+    except Exception as e:
+        print(f"  pre-poll capture failed {account['provider']} #{account['id']}: {e}")
+        prev, prev_credits = None, {}
     try:
         poller(conn, account, token)
         print(f"  ✓ {account['provider']:12} {account['email'] or account['label']}")
@@ -1028,13 +988,111 @@ def poll_account(conn, account) -> bool:
         store.log_event(conn, account["id"], "limit_poll", False, str(e))
         print(f"  ✗ {account['provider']:12} {account['email'] or account['label']}: {e}")
         return False
-    # Export so the menu bar app reflects the new account immediately.
+    _archive_closed_windows(conn, account, prev, prev_credits)
+    return True
+
+
+def _archive_closed_windows(conn, account, prev, prev_credits):
+    """Detect + archive windows closed since the previous successful snapshot.
+
+    Coupon hint: a reset_credits row that was "available" before the poll and
+    isn't afterwards (consumed or gone) marks a redeem from another device.
+    """
+    try:
+        new = store.latest_snapshot(conn, account["id"])
+        if not new or (prev and new["id"] == prev["id"]):
+            return
+        coupon_hint = False
+        if prev_credits:
+            cur = {c["credit_id"]: c["status"] for c in store.list_reset_credits(conn, account["id"])}
+            coupon_hint = any(st == "available" and cur.get(cid) != "available"
+                              for cid, st in prev_credits.items())
+            _archive_credit_disappearances(conn, account, prev_credits, cur, coupon_hint)
+        n = window_history.record_closed_windows(conn, account, prev, new, coupon_hint=coupon_hint)
+        if n:
+            print(f"  ⤷ archived {n} closed window(s): {account['provider']} #{account['id']}")
+            try:
+                import dashboard
+                dashboard.generate(conn)
+            except Exception as e:
+                print(f"  dashboard generation failed: {e}")
+    except Exception as e:
+        print(f"  window-history detection failed: {e}")
+
+
+def _archive_credit_disappearances(conn, account, prev_credits, cur, coupon_hint):
+    """Mark credits that vanished since the previous poll in the ledger.
+
+    Discriminator is the credit's expires_at: a past expiry means it expired
+    unused; a future expiry means it was consumed (redeem from another device
+    when coupon_hint is set) or provider-removed (gone). Our own redeems are
+    marked earlier in redeem_reset, so those rows stay 'redeemed'.
+    """
+    import datetime
+    disappeared = [cid for cid, st in prev_credits.items()
+                   if st == "available" and cur.get(cid) is None]
+    if not disappeared:
+        return
+    now_ts = time.time()
+    hist = {r["credit_id"]: r for r in store.list_credit_history(conn, account["provider"])
+            if r["account_id"] == account["id"]}
+    changed = False
+    for cid in disappeared:
+        row = hist.get(cid)
+        if not row or row.get("final_state") == "redeemed":
+            continue
+        exp = row.get("expires_at")
+        exp_ts = None
+        if exp:
+            try:
+                dt = datetime.datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+                exp_ts = dt.timestamp()
+            except (ValueError, TypeError):
+                exp_ts = None
+        if exp_ts is not None and exp_ts < now_ts:
+            state = "expired_unused"
+        elif coupon_hint:
+            state = "redeemed"
+        else:
+            state = "gone"
+        store.mark_credit_final(conn, account["id"], cid, state)
+        changed = True
+    if changed:
+        try:
+            import dashboard
+            dashboard.generate(conn)
+        except Exception as e:
+            print(f"  dashboard generation failed: {e}")
+
+
+def poll_some(conn, accounts) -> None:
+    """Poll the given accounts and export status.json once."""
+    for a in accounts:
+        # One account's unexpected failure must not abort the rest or the export.
+        try:
+            _poll_one(conn, a)
+        except Exception as e:
+            print(f"  ✗ poll failed {a['provider']} #{a['id']}: {e}")
     try:
         import status
         status.cmd_export(conn)
     except Exception as e:
         print(f"  export-status failed: {e}")
-    return True
+
+
+def poll_account(conn, account) -> bool:
+    """Poll a single account and refresh status.json. Returns True on success.
+
+    Used by onboarding so a freshly-added account immediately has subscription
+    data instead of waiting for the next 5-minute poll cycle.
+    """
+    ok = _poll_one(conn, account)
+    try:
+        import status
+        status.cmd_export(conn)
+    except Exception as e:
+        print(f"  export-status failed: {e}")
+    return ok
 
 
 def run_once(conn) -> int:
@@ -1047,41 +1105,119 @@ def run_once(conn) -> int:
             print("(no accounts to poll)")
             return 0
         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Polling {len(accounts)} accounts...")
-        for a in accounts:
-            token = store.get_token(conn, a["id"])
-            if not token:
-                store.save_snapshot(conn, a["id"], {"status": "error", "status_message": "no token"})
-                continue
-            token = _refresh_if_needed(conn, a, token)
-            poller = POLLERS.get(a["provider"])
-            if not poller:
-                store.save_snapshot(conn, a["id"], {"status": "error", "status_message": f"no poller for {a['provider']}"})
-                continue
-            try:
-                poller(conn, a, token)
-                print(f"  ✓ {a['provider']:12} {a['email'] or a['label']}")
-            except Exception as e:
-                store.save_snapshot(conn, a["id"], {"status": "error", "status_message": str(e)[:200]})
-                store.log_event(conn, a["id"], "limit_poll", False, str(e))
-                print(f"  ✗ {a['provider']:12} {a['email'] or a['label']}: {e}")
-        # Export status JSON for the menu bar app
-        try:
-            import status
-            status.cmd_export(conn)
-        except Exception as e:
-            print(f"  export-status failed: {e}")
+        poll_some(conn, accounts)
     return 0
 
 
+def max_used_pct(provider, snap) -> float:
+    """Highest used% across a snapshot's tracked windows (hotness signal)."""
+    vals = [w["used_pct"] for w in window_history.timed_windows(provider, snap)]
+    vals += [w["used_pct"] for w in window_history.drop_windows(provider, snap)]
+    return max(vals, default=0.0)
+
+
+def next_reset_at(provider, snap, now) -> float | None:
+    """Earliest future reset timestamp among the snapshot's timed windows."""
+    future = [w["reset_at"] for w in window_history.timed_windows(provider, snap)
+              if w["reset_at"] > now]
+    return min(future) if future else None
+
+
+def compute_next_due(now, *, provider, last_poll_ts, last_success_ts, hot, reset_at) -> float:
+    """Pure next-poll-time computation for one account.
+
+    Base cadence POLL_INTERVAL; hot accounts use HOT_INTERVAL_S. When
+    reset_at is within PRERESET_LEAD_S and no success has landed inside that
+    lead window yet, wake at the lead start and retry every PRERESET_RETRY_S,
+    last attempt no later than reset_at - PRERESET_FINAL_GAP_S. First success
+    wins.
+    """
+    interval = HOT_INTERVAL_S if hot else POLL_INTERVAL
+    due = last_poll_ts + interval
+    if reset_at:
+        lead_start = reset_at - PRERESET_LEAD_S
+        deadline = reset_at - PRERESET_FINAL_GAP_S
+        captured = last_success_ts is not None and last_success_ts >= lead_start
+        if not captured and now <= deadline:
+            if now < lead_start:
+                candidate = lead_start
+            else:
+                candidate = min(max(last_poll_ts + PRERESET_RETRY_S, now), deadline)
+            if candidate <= deadline:
+                due = min(due, candidate)
+    return due
+
+
+_next_local_scan = 0.0
+
+
+def _local_sync_tick(conn):
+    """Scan local CLI logs at most every LOCAL_SYNC_INTERVAL_S; export on change."""
+    global _next_local_scan
+    if time.time() < _next_local_scan:
+        return
+    _next_local_scan = time.time() + LOCAL_SYNC_INTERVAL_S
+    try:
+        import local_sync, status
+        if local_sync.scan(conn):
+            status.cmd_export(conn)
+    except Exception as e:
+        print(f"  local sync failed: {e}")
+
+
 def run_loop(conn) -> int:
-    print(f"Poller daemon started. Interval: {POLL_INTERVAL}s. Ctrl+C to stop.")
+    print(f"Poller daemon started. Base interval: {POLL_INTERVAL}s, hot: {HOT_INTERVAL_S}s, "
+          f"pre-reset lead: {PRERESET_LEAD_S}s. Ctrl+C to stop.")
+    # In-memory attempt times: copilot's hold-last-good path saves no snapshot
+    # on a transient failure, so DB timestamps alone would re-poll it instantly.
+    last_attempt: dict[int, float] = {}
     while True:
         try:
-            run_once(conn)
+            now = time.time()
+            accounts = store.list_accounts(conn)
+            _local_sync_tick(conn)
+            if not accounts:
+                time.sleep(POLL_INTERVAL)
+                continue
+            due, wake = [], now + POLL_INTERVAL
+            for a in accounts:
+                snap = store.latest_snapshot(conn, a["id"])
+                good = store.latest_successful_snapshot(conn, a["id"])
+                last_poll_ts = max(float(snap["ts"]) if snap else 0.0,
+                                   last_attempt.get(a["id"], 0.0))
+                t_due = compute_next_due(
+                    now,
+                    provider=a["provider"],
+                    last_poll_ts=last_poll_ts,
+                    last_success_ts=float(good["ts"]) if good else None,
+                    hot=bool(good) and max_used_pct(a["provider"], good) >= HOT_THRESHOLD_PCT,
+                    reset_at=next_reset_at(a["provider"], good, now) if good else None,
+                )
+                if t_due <= now:
+                    due.append(a)
+                else:
+                    wake = min(wake, t_due)
+            if due:
+                with work_queue.single_worker("poll") as acquired:
+                    if acquired:
+                        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+                        print(f"[{stamp}] Polling {len(due)}/{len(accounts)} due accounts...")
+                        for a in due:
+                            last_attempt[a["id"]] = time.time()
+                        poll_some(conn, due)
+                        continue
+                print("poll already running; waiting")
+                time.sleep(5)
+                continue
+            time.sleep(max(1.0, min(wake - time.time(), LOCAL_SYNC_INTERVAL_S)))
         except KeyboardInterrupt:
             print("\nPoller stopped.")
             return 0
-        time.sleep(POLL_INTERVAL)
+        except Exception as e:
+            # Never let a single bad cycle kill the daemon (LaunchAgent would
+            # crash-loop). Log, pause briefly so a persistent bug can't spin.
+            print(f"poll cycle error: {e}")
+            time.sleep(5)
 
 
 # ─── redeem reset credit ───────────────────────────────────────────────────
@@ -1120,6 +1256,17 @@ def redeem_reset(conn, account_id) -> int:
                       "ChatGPT-Account-Id": a["account_id"], "User-Agent": "agent-pool/1.0"})
     if st == 200:
         print(f"✓ Redeemed: {credit['title']}")
+        # Mark the credit as redeemed in the ledger before the re-poll wipes it
+        # from reset_credits, so it is never misclassified as expired_unused.
+        store.mark_credit_redeemed(conn, account_id, credit["credit_id"])
+        # Archive the closing windows now — before the confirmation re-poll —
+        # so the coupon row exists even if that re-poll fails.
+        try:
+            n = window_history.archive_coupon_redeem(conn, a, credit["credit_id"])
+            if n:
+                print(f"  ⤷ archived {n} window(s) as coupon reset")
+        except Exception as e:
+            print(f"  window-history archive failed: {e}")
         # Re-poll to show updated state
         poll_codex(conn, a, token)
         return 0

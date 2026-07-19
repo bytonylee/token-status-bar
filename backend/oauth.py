@@ -397,7 +397,16 @@ ANTIGRAVITY = {
 }
 
 
+def _ensure_antigravity_creds():
+    if ANTIGRAVITY["client_id"] and ANTIGRAVITY["client_secret"]:
+        return
+    client_id, client_secret = _load_antigravity_creds()
+    ANTIGRAVITY["client_id"] = client_id
+    ANTIGRAVITY["client_secret"] = client_secret
+
+
 def login_antigravity(incognito: bool = False) -> dict:
+    _ensure_antigravity_creds()
     if not ANTIGRAVITY["client_id"] or not ANTIGRAVITY["client_secret"]:
         raise RuntimeError(
             "Antigravity Google OAuth credentials missing. Put them in "
@@ -451,6 +460,7 @@ def login_antigravity(incognito: bool = False) -> dict:
 
 
 def refresh_antigravity(refresh_token: str) -> dict:
+    _ensure_antigravity_creds()
     st, tok = http_post(ANTIGRAVITY["token_url"], {
         "grant_type": "refresh_token",
         "client_id": ANTIGRAVITY["client_id"],

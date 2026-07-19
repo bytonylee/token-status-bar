@@ -42,8 +42,18 @@ Create `backend/test_claude_usage.py`:
 ```python
 """Tests for the Claude oauth/usage snapshot parser."""
 from __future__ import annotations
-import datetime, json, unittest
-import poller
+import datetime, json, os, sys, tempfile, time, unittest
+from unittest import mock
+
+_TMP = tempfile.mkdtemp(prefix="tsb-test-")
+os.environ["AGENT_POOL_DB"] = os.path.join(_TMP, "pool.db")
+os.environ["AGENT_POOL_STATUS_JSON"] = os.path.join(_TMP, "status.json")
+os.environ["AGENT_POOL_HISTORY_DIR"] = os.path.join(_TMP, "history")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import poller  # noqa: E402
+import status  # noqa: E402
+import store  # noqa: E402
 
 FIXTURE = {
     "five_hour": {"utilization": 41.0, "resets_at": "2026-07-16T13:59:59.819914+00:00",
@@ -107,7 +117,6 @@ class ClaudeUsageSnapTest(unittest.TestCase):
 
 class ClaudeExtraUsageApiTest(unittest.TestCase):
     def test_claude_extra_reads_usage_api(self):
-        import status
         snap = poller._claude_usage_snap(FIXTURE, {"plan": "Claude Max",
                                                    "subscription_status": "active"})
         out = status.claude_extra(snap)
@@ -116,6 +125,85 @@ class ClaudeExtraUsageApiTest(unittest.TestCase):
         self.assertEqual(out["primary_status"], "normal")
         self.assertEqual(out["secondary_status"], "normal")
         self.assertEqual(out["binding_window"], "5h")
+
+
+class ClaudePoll401RefreshTest(unittest.TestCase):
+    """poll_claude's 401 → refresh → retry branch (auth-critical DB side effects)."""
+
+    def setUp(self):
+        self.conn = store.connect()
+        # wipe between tests: the temp DB is shared module-wide
+        for t in ("refresh_log", "limit_snapshots", "tokens", "accounts"):
+            self.conn.execute(f"DELETE FROM {t}")
+        self.conn.commit()
+        aid = store.upsert_account(self.conn, "claude", "claude-401@example.com",
+                                   label="claude-401-test")
+        store.save_token(self.conn, aid, "old-access", "refresh-tok", "",
+                         time.time() + 3600)
+        self.account = store.get_account(self.conn, aid)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _events(self, kind):
+        return [e for e in store.recent_events(self.conn, self.account["id"])
+                if e["kind"] == kind]
+
+    def test_401_refresh_retry_succeeds(self):
+        # 401 on the stale token, 200 on the refreshed one; profile is
+        # best-effort so a non-200 there must not fail the poll.
+        def fake_get(url, headers, timeout=15):
+            if url != poller.CLAUDE_USAGE_URL:
+                return 404, "", {}
+            if headers["Authorization"] == "Bearer old-access":
+                return 401, {"error": "token expired"}, {}
+            self.assertEqual(headers["Authorization"], "Bearer new-access")
+            return 200, FIXTURE, {}
+
+        refreshed = {"access_token": "new-access", "refresh_token": "new-refresh",
+                     "id_token": "", "expires_at": time.time() + 3600, "raw": {}}
+        token = store.get_token(self.conn, self.account["id"])
+        with mock.patch.object(poller, "_get", side_effect=fake_get), \
+             mock.patch.object(poller.oauth, "refresh_claude",
+                               return_value=refreshed) as refresh:
+            poller.poll_claude(self.conn, self.account, token)
+        refresh.assert_called_once_with("refresh-tok")
+        snap = store.latest_snapshot(self.conn, self.account["id"])
+        self.assertEqual(snap["status"], "active")
+        self.assertEqual(snap["primary_used_pct"], 41.0)
+        saved = store.get_token(self.conn, self.account["id"])
+        self.assertEqual(saved["access_token"], "new-access")
+        self.assertEqual(saved["refresh_token"], "new-refresh")
+        refreshes = self._events("token_refresh")
+        self.assertEqual(len(refreshes), 1)
+        self.assertTrue(refreshes[0]["success"])
+        polls = self._events("limit_poll")
+        self.assertEqual(len(polls), 1)
+        self.assertTrue(polls[0]["success"])
+
+    def test_401_refresh_failure_writes_error_snapshot(self):
+        # 401 everywhere and a refresh that blows up: the poll must still land
+        # an error snapshot with the HTTP status, plus a logged refresh failure.
+        def fake_get(url, headers, timeout=15):
+            return 401, {"error": "token expired"}, {}
+
+        token = store.get_token(self.conn, self.account["id"])
+        with mock.patch.object(poller, "_get", side_effect=fake_get), \
+             mock.patch.object(poller.oauth, "refresh_claude",
+                               side_effect=RuntimeError("refresh boom")):
+            poller.poll_claude(self.conn, self.account, token)
+        snap = store.latest_snapshot(self.conn, self.account["id"])
+        self.assertEqual(snap["status"], "error")
+        self.assertIn("HTTP 401", snap["status_message"])
+        self.assertEqual(store.get_token(self.conn, self.account["id"])["access_token"],
+                         "old-access")
+        refreshes = self._events("token_refresh")
+        self.assertEqual(len(refreshes), 1)
+        self.assertFalse(refreshes[0]["success"])
+        self.assertIn("refresh boom", refreshes[0]["message"])
+        polls = self._events("limit_poll")
+        self.assertEqual(len(polls), 1)
+        self.assertFalse(polls[0]["success"])
 
 
 if __name__ == "__main__":
@@ -330,8 +418,15 @@ Create `backend/test_status_windows.py`:
 ```python
 """Tests for windows[] normalization and headline selection."""
 from __future__ import annotations
-import json, time, unittest
-import status
+import json, os, sys, tempfile, time, unittest
+
+_TMP = tempfile.mkdtemp(prefix="tsb-test-")
+os.environ["AGENT_POOL_DB"] = os.path.join(_TMP, "pool.db")
+os.environ["AGENT_POOL_STATUS_JSON"] = os.path.join(_TMP, "status.json")
+os.environ["AGENT_POOL_HISTORY_DIR"] = os.path.join(_TMP, "history")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import status  # noqa: E402
 
 
 def snap(**kw):
@@ -381,6 +476,7 @@ class NormalizeWindowsTest(unittest.TestCase):
     def test_copilot_premium_monthly(self):
         s = snap(primary_used_pct=12.1, primary_reset_at=2000.0)
         w = status.normalize_windows("copilot", s)
+        self.assertEqual(len(w), 1)
         self.assertEqual(w[0]["kind"], "monthly")
         self.assertEqual(w[0]["label"], "premium")
 
@@ -407,6 +503,27 @@ class NormalizeWindowsTest(unittest.TestCase):
         weekly = next(x for x in w if x["kind"] == "weekly")
         self.assertEqual(weekly["used_pct"], 8.0)
         self.assertEqual(weekly["label"], "gemini")
+
+    def test_antigravity_malformed_usage_window_skipped(self):
+        rj = json.dumps({"extra": {"usage_windows": [
+            {"group": "gemini", "window": "5h", "remaining_pct": "oops", "reset_at": None},
+            {"group": "gemini", "window": "weekly", "remaining_pct": 92.0, "reset_at": 4000.0},
+        ]}})
+        s = snap(primary_used_pct=0.0, raw_json=rj)
+        w = status.normalize_windows("antigravity", s)
+        kinds = [x["kind"] for x in w]
+        self.assertNotIn("5h", kinds)
+        self.assertIn("weekly", kinds)
+        weekly = next(x for x in w if x["kind"] == "weekly")
+        self.assertEqual(weekly["used_pct"], 8.0)
+
+    def test_devin_non_numeric_daily_skipped(self):
+        s = snap(daily_quota_remaining_percent="n/a",
+                 weekly_quota_remaining_percent=80.0,
+                 primary_reset_at=2000.0, secondary_reset_at=3000.0)
+        w = {x["kind"]: x for x in status.normalize_windows("devin", s)}
+        self.assertNotIn("daily", w)
+        self.assertEqual(w["weekly"]["used_pct"], 20.0)
 
     def test_error_snapshot_yields_nothing(self):
         self.assertEqual(status.normalize_windows("codex", snap(status="error")), [])
@@ -496,6 +613,14 @@ def _win(kind, label, used, reset_epoch, *, severity=None, is_active=None,
             "is_active": is_active, "source": source, "as_of_epoch": as_of}
 
 
+def _pct(v):
+    """float(v), or None when the value is missing or non-numeric."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _snap_raw(snap) -> dict:
     try:
         rj = json.loads(snap.get("raw_json") or "{}")
@@ -554,11 +679,13 @@ def normalize_windows(provider, snap) -> list[dict]:
         add(_win("monthly", "chat", snap.get("secondary_used_pct"),
                  snap.get("primary_reset_at"), source=src, as_of=as_of))
     elif provider == "devin":
-        if snap.get("daily_quota_remaining_percent") is not None:
-            add(_win("daily", None, 100.0 - float(snap["daily_quota_remaining_percent"]),
+        daily_rem = _pct(snap.get("daily_quota_remaining_percent"))
+        if daily_rem is not None:
+            add(_win("daily", None, 100.0 - daily_rem,
                      snap.get("primary_reset_at"), source=src, as_of=as_of))
-        if snap.get("weekly_quota_remaining_percent") is not None:
-            add(_win("weekly", None, 100.0 - float(snap["weekly_quota_remaining_percent"]),
+        weekly_rem = _pct(snap.get("weekly_quota_remaining_percent"))
+        if weekly_rem is not None:
+            add(_win("weekly", None, 100.0 - weekly_rem,
                      snap.get("secondary_reset_at"), source=src, as_of=as_of))
     elif provider == "antigravity":
         label = None
@@ -569,11 +696,14 @@ def normalize_windows(provider, snap) -> list[dict]:
         add(_win("model_weekly", label, snap.get("primary_used_pct"),
                  snap.get("primary_reset_at"), source=src, as_of=as_of))
         for w in (rj.get("extra") or {}).get("usage_windows") or []:
-            if not isinstance(w, dict) or w.get("remaining_pct") is None:
+            if not isinstance(w, dict):
+                continue
+            rem_pct = _pct(w.get("remaining_pct"))
+            if rem_pct is None:
                 continue
             kind = "weekly" if w.get("window") == "weekly" else "5h"
             add(_win(kind, w.get("group"),
-                     max(0.0, min(100.0, 100.0 - float(w["remaining_pct"]))),
+                     max(0.0, min(100.0, 100.0 - rem_pct)),
                      w.get("reset_at"), source=src, as_of=as_of))
     return out
 
@@ -656,9 +786,16 @@ Create `backend/test_local_sync.py`:
 ```python
 """Tests for local session-log sync (pure helpers)."""
 from __future__ import annotations
-import json, os, tempfile, unittest
+import json, os, sys, tempfile, unittest
 from pathlib import Path
-import local_sync
+
+_TMP = tempfile.mkdtemp(prefix="tsb-test-")
+os.environ["AGENT_POOL_DB"] = os.path.join(_TMP, "pool.db")
+os.environ["AGENT_POOL_STATUS_JSON"] = os.path.join(_TMP, "status.json")
+os.environ["AGENT_POOL_HISTORY_DIR"] = os.path.join(_TMP, "history")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import local_sync  # noqa: E402
 
 CODEX_EVENT = {
     "timestamp": "2026-07-16T13:45:00.000Z",
@@ -1444,8 +1581,15 @@ Create `backend/test_burn_rate.py`:
 ```python
 """Tests for burn-rate projection."""
 from __future__ import annotations
-import unittest
-import status
+import os, sys, tempfile, unittest
+
+_TMP = tempfile.mkdtemp(prefix="tsb-test-")
+os.environ["AGENT_POOL_DB"] = os.path.join(_TMP, "pool.db")
+os.environ["AGENT_POOL_STATUS_JSON"] = os.path.join(_TMP, "status.json")
+os.environ["AGENT_POOL_HISTORY_DIR"] = os.path.join(_TMP, "history")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import status  # noqa: E402
 
 
 class ProjectExhaustTest(unittest.TestCase):

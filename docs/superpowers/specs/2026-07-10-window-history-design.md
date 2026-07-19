@@ -100,6 +100,22 @@ Rules:
      `coupon` when coupon evidence exists (`banked_resets` decreased between
      the two snapshots, or a `reset_credits` row flipped from available),
      else `provider_reset`.
+   - **Sliding-reset guard.** An idle account can report a `reset_at` that
+     tracks "now" (`reset_at ≈ ts + window_s`) on every poll — observed on an
+     idle codex account that sat at ~1% usage for 10 days and produced 2133
+     false `provider_reset` rows in the first backfill. That slide moves the
+     boundary forward by ≈ the poll gap. So a window is archived only when the
+     forward jump exceeds the snapshot gap by more than the tolerance
+     (`r_new - r_old > (new_ts - prev_ts) + 120s`) — applied to both the natural
+     and early branches — and, for an early reset, `used_pct` also actually
+     fell. A genuine reset jumps the boundary by the elapsed part of the window
+     (far more than the gap) and (when early) collapses usage, so it still
+     passes. The guard knowingly misses three low-impact cases: an early reset
+     within ~gap+120s of a fresh window (jump too small to distinguish from a
+     slide); one where `used_pct` climbed past the previous reading within a
+     single poll gap; and a legitimate single natural roll observed only across
+     a poll gap ≥ the window length (sleep/outage), whose final reading was
+     already maximally stale.
 3. **Windows without a reset timestamp** (copilot chat, devin daily/weekly):
    the window closed when `used_pct` dropped by >10 points. `window_end` =
    new snapshot ts; cause `natural` if within 1h of a related known boundary

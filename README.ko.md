@@ -108,7 +108,7 @@ flowchart TD
     P --> Q[잔여 % + 리셋 시간 파싱]
     Q --> R[(pool.db 스냅샷)]
     R --> S[status.json]
-    S --> T["MenuBarAgent.app<br/>30초마다 읽기"]
+    S --> T["TokenStatusBar.app<br/>30초마다 읽기"]
     T --> U[메뉴 막대 드롭다운 + 점]
 ```
 
@@ -146,7 +146,7 @@ flowchart TD
     K --> L[store.save_snapshot]
     L --> I
     I --> M[status.cmd_export → status.json]
-    M --> N["MenuBarAgent.app 30초마다 읽기 → 드롭다운 UI + 점"]
+    M --> N["TokenStatusBar.app 30초마다 읽기 → 드롭다운 UI + 점"]
 ```
 
 ## 요구 사항
@@ -159,8 +159,8 @@ flowchart TD
 
 | 경로                 | 용도 |
 |----------------------|------|
-| `app/MenuBarAgent.swift` | 단일 파일 Swift 메뉴 막대 UI. |
-| `build-app.sh`       | `MenuBarAgent.app` 컴파일 및 번들링. |
+| `app/TokenStatusBar.swift` | 단일 파일 Swift 메뉴 막대 UI. |
+| `build.sh`           | `TokenStatusBar.app` 컴파일 및 번들링. |
 | `backend/pool.py`    | CLI: 온보딩, 폴링, 상태 내보내기. |
 | `backend/poller.py`  | 제공자별 실시간 쿼터 폴링. |
 | `backend/status.py`  | 앱이 읽을 `status.json` 생성. |
@@ -176,8 +176,8 @@ flowchart TD
 ## 앱 빌드 및 실행
 
 ```bash
-./build-app.sh
-open MenuBarAgent.app
+./build.sh
+open /Applications/TokenStatusBar.app
 ```
 
 앱은 30초마다 `status.json`을 읽고 메뉴 막대에 차트 아이콘을 표시합니다.

@@ -3,8 +3,8 @@
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="TokenStatusBar"
-APP_DIR="$DIR/$APP_NAME.app"
 BUILD_DIR="$DIR/build"
+APP_DIR="$BUILD_DIR/$APP_NAME.app"
 INSTALL_DIR="/Applications/$APP_NAME.app"
 
 # ─── Bundled Python (python-build-standalone) ────────────────────────────

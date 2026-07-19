@@ -11,7 +11,7 @@ For each provider this asserts two things:
 Run:  python test_onboarding.py
 """
 from __future__ import annotations
-import json, os, sys, tempfile, time, unittest
+import datetime, json, os, sys, tempfile, time, unittest
 import urllib.request
 from pathlib import Path
 from unittest import mock
@@ -24,6 +24,10 @@ os.environ["AGENT_POOL_STATUS_JSON"] = str(Path(_TMP) / "status.json")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import store, oauth, poller, pool, status  # noqa: E402
+
+
+def _iso(ts):
+    return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).isoformat()
 
 
 # ─── fake HTTP ──────────────────────────────────────────────────────────────
@@ -66,15 +70,42 @@ def _fake_urlopen(req, timeout=None):
              "expires_at": "2026-12-31T00:00:00Z", "granted_at": "2026-01-01T00:00:00Z",
              "description": "banked"},
         ]}, {})
+    if "backend-api/accounts/check/v4-2023-04-27" in url:
+        return _FakeResp(200, {"accounts": {"codex-acct-1": {
+            "account": {"account_id": "codex-acct-1", "plan_type": "pro",
+                        "has_previously_paid_subscription": True},
+            "entitlement": {"subscription_id": "sub-1", "has_active_subscription": True,
+                            "is_active_subscription_gratis": False,
+                            "subscription_plan": "chatgptpro_partner_managed",
+                            "renews_at": "2026-08-09T14:59:59+00:00",
+                            "expires_at": "2026-08-16T14:59:59+00:00"},
+        }}}, {})
+    if "backend-api/accounts" in url:
+        return _FakeResp(200, {"items": [
+            {"id": "codex-acct-1", "created_time": "2023-06-06T14:41:24.785528Z"},
+        ]}, {})
     # ── claude ──
-    if "api.anthropic.com/v1/messages" in url:
-        return _FakeResp(200, {}, {
-            "anthropic-ratelimit-unified-5h-utilization": "0.07",
-            "anthropic-ratelimit-unified-5h-reset": str(time.time() + 18000),
-            "anthropic-ratelimit-unified-7d-utilization": "0.20",
-            "anthropic-ratelimit-unified-7d-reset": str(time.time() + 604800),
-            "anthropic-ratelimit-unified-status": "ok",
-        })
+    if "api.anthropic.com/api/oauth/usage" in url:
+        five_hour_reset = _iso(time.time() + 18000)
+        seven_day_reset = _iso(time.time() + 604800)
+        return _FakeResp(200, {
+            "five_hour": {"utilization": 7.0, "resets_at": five_hour_reset,
+                          "limit_dollars": None, "used_dollars": None,
+                          "remaining_dollars": None},
+            "seven_day": {"utilization": 20.0, "resets_at": seven_day_reset,
+                         "limit_dollars": None, "used_dollars": None,
+                         "remaining_dollars": None},
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 7,
+                 "severity": "normal", "resets_at": five_hour_reset,
+                 "scope": None, "is_active": True},
+                {"kind": "weekly_all", "group": "weekly", "percent": 20,
+                 "severity": "normal", "resets_at": seven_day_reset,
+                 "scope": None, "is_active": False},
+            ],
+            "extra_usage": {"is_enabled": False, "monthly_limit": None,
+                            "used_credits": None, "utilization": None},
+        }, {})
     if "api.anthropic.com/api/oauth/profile" in url:
         return _FakeResp(200, {
             "account": {"has_claude_max": True, "display_name": "Test",
@@ -183,7 +214,7 @@ class OnboardingPollTests(unittest.TestCase):
     def setUp(self):
         self.conn = store.connect()
         # wipe between tests
-        for t in ("reset_credits", "refresh_log", "limit_snapshots", "tokens", "accounts"):
+        for t in ("subscription_meta", "reset_credits", "refresh_log", "limit_snapshots", "tokens", "accounts"):
             self.conn.execute(f"DELETE FROM {t}")
         self.conn.commit()
         self._urlopen_patch = mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen)
@@ -227,6 +258,24 @@ class OnboardingPollTests(unittest.TestCase):
         self.assertEqual(snap["status"], "active",
                          f"devin onboarding did not produce an active snapshot: "
                          f"{snap.get('status_message')}")
+
+    def test_reconnect_oauth_account_updates_existing_account(self):
+        """cmd_reconnect must refresh credentials in place and poll immediately."""
+        acct, _ = self._onboard("codex")
+        reconnected = _fake_login("codex")
+        reconnected["access_token"] = "fake-codex-reconnected-access"
+        reconnected["refresh_token"] = "fake-codex-reconnected-refresh"
+        with mock.patch.dict(oauth.LOGIN_FUNCS, {"codex": lambda incognito=False: reconnected}):
+            rc = pool.cmd_reconnect(str(acct["id"]))
+        self.assertEqual(rc, 0)
+        accounts = [a for a in store.list_accounts(self.conn) if a["provider"] == "codex"]
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0]["id"], acct["id"])
+        token = store.get_token(self.conn, acct["id"])
+        self.assertEqual(token["access_token"], "fake-codex-reconnected-access")
+        snap = store.latest_snapshot(self.conn, acct["id"])
+        self.assertIsNotNone(snap, "reconnect did not poll the account")
+        self.assertEqual(snap["status"], "active")
 
     # ── per-provider subscription field coverage ──
     def test_codex_subscription_data(self):
@@ -319,7 +368,7 @@ class OnboardingPollTests(unittest.TestCase):
         }):
             self.assertEqual(pool.cmd_add_devin("fake-devin-key", "devin-test"), 0)
 
-        payload = json.loads(Path(os.environ["AGENT_POOL_STATUS_JSON"]).read_text())
+        payload = json.loads(Path(status.STATUS_JSON).read_text())
         by_provider = {a["provider"]: a for a in payload["accounts"]}
         xai = by_provider["xai"]
         self.assertEqual(xai["monthly_period_start"], "2026-01-01 09:00")
@@ -329,6 +378,44 @@ class OnboardingPollTests(unittest.TestCase):
         devin = by_provider["devin"]
         self.assertIsNotNone(devin["plan_start"])
         self.assertIsNotNone(devin["plan_reset"])
+
+    def test_export_includes_codex_subscription_meta(self):
+        acct, _ = self._onboard("codex")
+        store.upsert_subscription_meta(
+            self.conn,
+            acct["id"],
+            paid_since="2026-06-09T00:05:39Z",
+            renews_at="2026-07-09T14:59:59Z",
+            account_created_at="2023-06-06T14:41:24Z",
+            previous_paid_months=3,
+            billing_note="confirmed prior Pro billing history",
+        )
+
+        status.cmd_export(self.conn)
+        payload = json.loads(Path(status.STATUS_JSON).read_text())
+        codex = next(a for a in payload["accounts"] if a["provider"] == "codex")
+        self.assertEqual(codex["plan_start"], "2026-06-09 09:05")
+        self.assertEqual(codex["plan_reset"], "2026-07-09 23:59")
+        self.assertEqual(codex["account_created"], "2023-06-06 23:41")
+        self.assertEqual(codex["payment_history"], "previous 3 months")
+
+    def test_codex_subscription_meta_syncs_from_account_endpoints(self):
+        acct, _ = self._onboard("codex")
+        meta = store.get_subscription_meta(self.conn, acct["id"])
+        self.assertEqual(meta["account_created_at"], "2023-06-06T14:41:24.785528Z")
+        self.assertEqual(meta["renews_at"], "2026-08-09T14:59:59+00:00")
+        self.assertEqual(meta["expires_at"], "2026-08-16T14:59:59+00:00")
+        self.assertEqual(meta["subscription_plan"], "chatgptpro_partner_managed")
+        self.assertEqual(meta["has_active_subscription"], 1)
+        self.assertEqual(meta["is_active_subscription_gratis"], 0)
+        self.assertEqual(meta["has_previously_paid_subscription"], 1)
+
+        status.cmd_export(self.conn)
+        payload = json.loads(Path(status.STATUS_JSON).read_text())
+        codex = next(a for a in payload["accounts"] if a["provider"] == "codex")
+        self.assertEqual(codex["plan_reset"], "2026-08-09 23:59")
+        self.assertEqual(codex["expires_at"], "2026-08-16 23:59")
+        self.assertEqual(codex["subscription_plan"], "chatgptpro_partner_managed")
 
 
 if __name__ == "__main__":

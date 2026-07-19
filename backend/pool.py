@@ -21,6 +21,8 @@ Usage:
   pool.py reset <account_id>           Redeem a Codex banked reset credit
   pool.py set-tier <account_id> <tier> Set manual tier override (e.g. 5x, 20x)
   pool.py export-status                Write status JSON for the menu bar app
+  pool.py dashboard [--open]           Regenerate history/dashboard.html (--open opens it)
+  pool.py backfill-history             Archive historical windows from limit_snapshots
 """
 from __future__ import annotations
 import json, os, sys, time, datetime
@@ -309,6 +311,24 @@ def main(argv):
     if cmd == "export-status":
         import status
         return status.cmd_export(DB)
+    if cmd == "dashboard":
+        import subprocess
+        import dashboard
+        path = dashboard.generate(DB)
+        print(f"Wrote {path}")
+        if "--open" in argv[1:]:
+            subprocess.run(["open", str(path)], check=False)
+        return 0
+    if cmd == "backfill-history":
+        import dashboard
+        import window_history
+        print("Backfilling window history from limit_snapshots...")
+        n = window_history.backfill(DB)
+        print("Backfilling reset-credit ledger...")
+        nc = window_history.backfill_credit_history(DB)
+        path = dashboard.generate(DB)
+        print(f"Backfilled {n} closed windows, {nc} reconstructed credit(s). Dashboard: {path}")
+        return 0
     if cmd == "reset":
         import poller
         if len(argv) < 2:

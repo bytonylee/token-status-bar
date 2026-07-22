@@ -58,6 +58,30 @@ class ParseUsagePanelTests(unittest.TestCase):
         self.assertIsNone(agy_usage.parse_usage_panel("no quota panel here"))
         self.assertIsNone(agy_usage.parse_usage_panel(""))
 
+    def _one_window(self, refresh_line, now=1_000_000.0):
+        panel = ("GEMINI MODELS\n  Weekly Limit\n"
+                 "    [██████████] 80.00%\n"
+                 f"    80% remaining · {refresh_line}\n")
+        windows = agy_usage.parse_usage_panel(panel, now=now)
+        self.assertIsNotNone(windows)
+        self.assertEqual(len(windows), 1)
+        return windows[0]
+
+    def test_refresh_with_days(self):
+        now = 1_000_000.0
+        w = self._one_window("Refreshes in 6d 7h", now=now)
+        self.assertEqual(w["reset_at"], now + 6 * 86400 + 7 * 3600)
+
+    def test_refresh_seconds_only(self):
+        now = 1_000_000.0
+        w = self._one_window("Refreshes in 45s", now=now)
+        self.assertEqual(w["reset_at"], now + 45)
+
+    def test_refresh_under_a_minute(self):
+        now = 1_000_000.0
+        w = self._one_window("Refreshes in <1m", now=now)
+        self.assertEqual(w["reset_at"], now + 60)
+
 
 import json
 import status  # noqa: E402

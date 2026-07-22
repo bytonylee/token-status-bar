@@ -37,10 +37,20 @@ COPILOT_IDE_HEADERS = {
 }
 
 
-def _get(url, headers, timeout=15):
-    req = urllib.request.Request(url, method="GET")
-    for k, v in (headers or {}).items():
-        req.add_header(k, v)
+RETRYABLE_STATUSES = (429, 500, 502, 503, 504)
+HTTP_RETRIES = 2  # extra attempts after the first; backoff 1s then 2s
+
+
+def _http_error_body(e):
+    """Read an HTTPError body once; JSON when possible, text otherwise."""
+    raw = e.read()
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw.decode(errors="replace")
+
+
+def _send(req, timeout):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
@@ -50,13 +60,39 @@ def _get(url, headers, timeout=15):
                 body = raw.decode(errors="replace")
             return r.status, body, dict(r.headers)
     except urllib.error.HTTPError as e:
-        try:
-            body = json.loads(e.read())
-        except Exception:
-            body = e.read().decode(errors="replace")
-        return e.code, body, dict(e.headers)
+        return e.code, _http_error_body(e), dict(e.headers)
     except urllib.error.URLError as e:
         return 0, str(e.reason), {}
+
+
+def _send_with_retry(req, timeout):
+    """Bounded retry on 429/5xx and network errors (honors integer Retry-After)."""
+    st, body, hdrs = 0, "", {}
+    delay = 1.0
+    for attempt in range(HTTP_RETRIES + 1):
+        st, body, hdrs = _send(req, timeout)
+        if st != 0 and st not in RETRYABLE_STATUSES:
+            return st, body, hdrs
+        if attempt == HTTP_RETRIES:
+            break
+        wait = delay
+        retry_after = (hdrs or {}).get("Retry-After")
+        if retry_after is not None:
+            try:
+                # Cap so total added latency stays bounded.
+                wait = max(0.0, min(float(int(retry_after)), 10.0))
+            except (TypeError, ValueError):
+                pass
+        time.sleep(wait)
+        delay *= 2
+    return st, body, hdrs
+
+
+def _get(url, headers, timeout=15):
+    req = urllib.request.Request(url, method="GET")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    return _send_with_retry(req, timeout)
 
 
 def _post(url, data, headers, timeout=15):
@@ -65,20 +101,13 @@ def _post(url, data, headers, timeout=15):
     req.add_header("Content-Type", "application/json")
     for k, v in (headers or {}).items():
         req.add_header(k, v)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read()
-            try:
-                return r.status, json.loads(raw), dict(r.headers)
-            except json.JSONDecodeError:
-                return r.status, raw.decode(errors="replace"), dict(r.headers)
-    except urllib.error.HTTPError as e:
-        try:
-            return e.code, json.loads(e.read()), dict(e.headers)
-        except Exception:
-            return e.code, e.read().decode(errors="replace"), dict(e.headers)
-    except urllib.error.URLError as e:
-        return 0, str(e.reason), {}
+    return _send_with_retry(req, timeout)
+
+
+def _shape_error(source, resp):
+    """Error snapshot for a response that isn't the expected JSON object."""
+    return {"status": "error",
+            "status_message": f"{source}: unexpected response shape: {str(resp)[:120]}"}
 
 
 # ─── Codex wham ────────────────────────────────────────────────────────────
@@ -96,19 +125,23 @@ def poll_codex(conn, account, token):
         store.save_snapshot(conn, account["id"], snap)
         store.log_event(conn, account["id"], "limit_poll", False, snap["status_message"])
         return
-    if isinstance(usage, dict):
-        snap["plan"] = usage.get("plan_type")
-        rl = usage.get("rate_limit") or {}
-        pw = rl.get("primary_window") or {}
-        sw = rl.get("secondary_window") or {}
-        snap["primary_used_pct"] = pw.get("used_percent")
-        snap["primary_reset_at"] = (time.time() + pw["reset_after_seconds"]) if pw.get("reset_after_seconds") is not None else None
-        snap["primary_window_s"] = pw.get("limit_window_seconds")
-        snap["secondary_used_pct"] = sw.get("used_percent")
-        snap["secondary_reset_at"] = (time.time() + sw["reset_after_seconds"]) if sw.get("reset_after_seconds") is not None else None
-        snap["secondary_window_s"] = sw.get("limit_window_seconds")
-        snap["credits_balance"] = (usage.get("credits") or {}).get("balance")
-        snap["banked_resets"] = (usage.get("rate_limit_reset_credits") or {}).get("available_count")
+    if not isinstance(usage, dict):
+        snap = _shape_error("wham/usage", usage)
+        store.save_snapshot(conn, account["id"], snap)
+        store.log_event(conn, account["id"], "limit_poll", False, snap["status_message"])
+        return
+    snap["plan"] = usage.get("plan_type")
+    rl = usage.get("rate_limit") or {}
+    pw = rl.get("primary_window") or {}
+    sw = rl.get("secondary_window") or {}
+    snap["primary_used_pct"] = pw.get("used_percent")
+    snap["primary_reset_at"] = (time.time() + pw["reset_after_seconds"]) if pw.get("reset_after_seconds") is not None else None
+    snap["primary_window_s"] = pw.get("limit_window_seconds")
+    snap["secondary_used_pct"] = sw.get("used_percent")
+    snap["secondary_reset_at"] = (time.time() + sw["reset_after_seconds"]) if sw.get("reset_after_seconds") is not None else None
+    snap["secondary_window_s"] = sw.get("limit_window_seconds")
+    snap["credits_balance"] = (usage.get("credits") or {}).get("balance")
+    snap["banked_resets"] = (usage.get("rate_limit_reset_credits") or {}).get("available_count")
     store.save_snapshot(conn, account["id"], snap)
 
     # reset credits detail
@@ -188,13 +221,20 @@ def poll_claude(conn, account, token):
     st, body, _ = _fetch(token["access_token"])
     if st == 401 and token.get("refresh_token"):
         # One refresh + retry; a second 401 becomes an error snapshot.
+        # The lock serializes rotating-refresh-token use across processes.
         try:
-            result = oauth.refresh_claude(token["refresh_token"])
-            store.save_token(conn, account["id"], result["access_token"],
-                             result.get("refresh_token"), result.get("id_token"),
-                             result.get("expires_at"), result.get("raw"))
-            store.log_event(conn, account["id"], "token_refresh", True, "")
-            token = store.get_token(conn, account["id"])
+            with work_queue.exclusive("token_refresh"):
+                latest = store.get_token(conn, account["id"]) or token
+                if latest["access_token"] != token["access_token"]:
+                    # Another process already refreshed while we waited.
+                    token = latest
+                else:
+                    result = oauth.refresh_claude(token["refresh_token"])
+                    store.save_token(conn, account["id"], result["access_token"],
+                                     result.get("refresh_token"), result.get("id_token"),
+                                     result.get("expires_at"), result.get("raw"))
+                    store.log_event(conn, account["id"], "token_refresh", True, "")
+                    token = store.get_token(conn, account["id"])
             st, body, _ = _fetch(token["access_token"])
         except Exception as e:
             store.log_event(conn, account["id"], "token_refresh", False, str(e))
@@ -302,6 +342,9 @@ def poll_xai(conn, account, token):
         req.add_header("X-XAI-Token-Auth", "xai-grok-cli")
         with urllib.request.urlopen(req, timeout=15) as r:
             resp = json.loads(r.read())
+        if not isinstance(resp, dict):
+            snap = _shape_error("billing", resp)
+        else:
             config = resp.get("config", {})
             used = config.get("used", {}).get("val", 0)
             limit = config.get("monthlyLimit", {}).get("val", 0)
@@ -339,6 +382,8 @@ def poll_xai(conn, account, token):
         snap = {"status": "error", "status_message": f"billing HTTP {e.code}: {msg}"}
     except urllib.error.URLError as e:
         snap = {"status": "error", "status_message": str(e.reason)}
+    except json.JSONDecodeError as e:
+        snap = _shape_error("billing", f"invalid JSON: {e}")
 
     # Step 2: Also probe the chat API for daily rate-limit headers
     body = json.dumps({
@@ -357,6 +402,8 @@ def poll_xai(conn, account, token):
             if "primary_used_pct" in daily:
                 snap["secondary_used_pct"] = daily["primary_used_pct"]
                 snap["secondary_window_s"] = 86400
+                if daily.get("primary_reset_at"):
+                    snap["secondary_reset_at"] = daily["primary_reset_at"]
             if "rate_limit_remaining" in daily:
                 snap["daily_remaining"] = daily["rate_limit_remaining"]
     except urllib.error.HTTPError as e:
@@ -366,6 +413,8 @@ def poll_xai(conn, account, token):
             daily = _xai_snap(hdrs, "rate_limited", f"429: {msg}")
             snap["secondary_used_pct"] = daily.get("primary_used_pct", 100.0)
             snap["secondary_window_s"] = 86400
+            if daily.get("primary_reset_at"):
+                snap["secondary_reset_at"] = daily["primary_reset_at"]
             if snap["status"] == "active":
                 snap["status"] = "rate_limited"
                 snap["status_message"] = "daily rate limited"
@@ -440,19 +489,6 @@ def poll_antigravity(conn, account, token):
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             resp = json.loads(r.read())
-            current = resp.get("currentTier", {})
-            paid = resp.get("paidTier") or {}
-            allowed = resp.get("allowedTiers") or []
-            # The session's active Code Assist tier is currentTier (often free-tier),
-            # but the user's actual entitlement lives in paidTier. Prefer paidTier.
-            tier = paid if paid.get("id") else current
-            if not tier.get("id") and allowed:
-                tier = allowed[0]
-            plan = tier.get("name", "Gemini Code Assist")
-            tier_id = tier.get("id")
-            tier_desc = tier.get("description")
-            active_tier_id = current.get("id")
-            project = resp.get("cloudaicompanionProject", "")
     except urllib.error.HTTPError as e:
         msg = e.read().decode(errors="replace")[:120]
         snap = {"status": "error", "status_message": f"loadCodeAssist HTTP {e.code}: {msg}"}
@@ -464,6 +500,29 @@ def poll_antigravity(conn, account, token):
         store.save_snapshot(conn, account["id"], snap)
         store.log_event(conn, account["id"], "limit_poll", False, snap["status_message"])
         return
+    except json.JSONDecodeError as e:
+        snap = _shape_error("loadCodeAssist", f"invalid JSON: {e}")
+        store.save_snapshot(conn, account["id"], snap)
+        store.log_event(conn, account["id"], "limit_poll", False, snap["status_message"])
+        return
+    if not isinstance(resp, dict):
+        snap = _shape_error("loadCodeAssist", resp)
+        store.save_snapshot(conn, account["id"], snap)
+        store.log_event(conn, account["id"], "limit_poll", False, snap["status_message"])
+        return
+    current = resp.get("currentTier", {})
+    paid = resp.get("paidTier") or {}
+    allowed = resp.get("allowedTiers") or []
+    # The session's active Code Assist tier is currentTier (often free-tier),
+    # but the user's actual entitlement lives in paidTier. Prefer paidTier.
+    tier = paid if paid.get("id") else current
+    if not tier.get("id") and allowed:
+        tier = allowed[0]
+    plan = tier.get("name", "Gemini Code Assist")
+    tier_id = tier.get("id")
+    tier_desc = tier.get("description")
+    active_tier_id = current.get("id")
+    project = resp.get("cloudaicompanionProject", "")
 
     # Step 2: fetch real-time per-model quota via fetchAvailableModels.
     # Response: models[<key>].quotaInfo.remainingFraction (0..1) + .resetTime (ISO8601).
@@ -480,7 +539,11 @@ def poll_antigravity(conn, account, token):
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             resp = json.loads(r.read())
-        snap.update(_antigravity_quota(resp.get("models", {}), plan))
+        if isinstance(resp, dict):
+            snap.update(_antigravity_quota(resp.get("models") or {}, plan))
+        else:
+            snap["status"] = "error"
+            snap["status_message"] = f"fetchAvailableModels: unexpected response shape: {str(resp)[:120]}"
     except urllib.error.HTTPError as e:
         body_resp = e.read().decode(errors="replace")[:120]
         snap["status"] = "error"
@@ -488,6 +551,9 @@ def poll_antigravity(conn, account, token):
     except urllib.error.URLError as e:
         snap["status"] = "error"
         snap["status_message"] = str(e.reason)
+    except json.JSONDecodeError as e:
+        snap["status"] = "error"
+        snap["status_message"] = f"fetchAvailableModels: invalid JSON: {e}"
 
     try:
         import agy_usage
@@ -603,13 +669,20 @@ def poll_copilot(conn, account, token):
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             user = json.loads(r.read())
-        snap = _copilot_quota_snap(user, sku)
+        if isinstance(user, dict):
+            snap = _copilot_quota_snap(user, sku)
+        else:
+            snap = _shape_error("copilot_internal/user", user)
+            snap["sku"] = sku
     except urllib.error.HTTPError as e:
         msg = e.read().decode(errors="replace")[:120]
         snap = {"status": "error" if e.code != 429 else "rate_limited",
                 "status_message": f"user HTTP {e.code}: {msg}", "sku": sku}
     except urllib.error.URLError as e:
         snap = {"status": "error", "status_message": str(e.reason), "sku": sku}
+    except json.JSONDecodeError as e:
+        snap = _shape_error("copilot_internal/user", f"invalid JSON: {e}")
+        snap["sku"] = sku
 
     # Quota fields from the token response (populated on limited/free SKUs)
     if limited_quota is not None:
@@ -684,8 +757,11 @@ def _copilot_quota_snap(user, sku):
     if reset_date:
         snap["rate_limit_reset"] = reset_date
         try:
-            snap["primary_reset_at"] = datetime.datetime.fromisoformat(
-                reset_date).replace(tzinfo=datetime.timezone.utc).timestamp()
+            dt = datetime.datetime.fromisoformat(reset_date)
+            # Naive timestamps are UTC; explicit offsets must be preserved.
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            snap["primary_reset_at"] = dt.astimezone(datetime.timezone.utc).timestamp()
         except ValueError:
             pass
     else:
@@ -759,17 +835,25 @@ def _devin_encode_str(field_num, s):
     return _devin_encode_varint((field_num << 3) | 2) + _devin_encode_varint(len(data)) + data
 
 
+# Client identity constants sent in the GetUserStatus protobuf request.
+DEVIN_CLIENT_NAME = "chisel"
+DEVIN_CLIENT_VERSION = "2026.8.18"
+DEVIN_CLIENT_PLATFORM = "mac"
+DEVIN_CLIENT_LOCALE = "en"
+DEVIN_CLIENT_FINGERPRINT = "080d03eeaa0cd7a10d0e0c84c26cb9a1c533e2675c14a85c3a971248f6521a710e4c02372539fc56c8b6a0454553533dc7f9e54fa3c16a2b141c87d0fb43a8b6a7e32b15a2267290298a6c6382e7b0096e06b41012d46d998f947b53a35b84c55ab589c683c6a3727aa5bf90c18e349fba8ac069b4121f5298fbacca590c903f169850ec072da539ed40d46f212aea973c725221098fcea6fb6fde32a7ef324003cb070e8a603c8c7a1d6743cfadd9e86f53797b32bb88b11abe8bcc98ec38473496bd9aaf482c6ab2c5def224bb7f554687cd78202159112e1cdee29b1c44b38cd407629d59c9dc0e2eab891ccacca859f358d7641acedc7fed0ba64a4d3e3a4827ac433bae69f7e48917ff2a6df24e2adf4fb9ed88ed8266228b99604a7cba3356fc28cb304de708958d188143f12eff3d52178a680c86073b21bc1efbf45a44b09887b60e9fe13ae9e5256e640b7159a595dcd5ecb2b470a290cf30357403e4a820dfb0ce990517e2cd64"
+
+
 def _devin_build_request(at):
     """Build the GetUserStatusRequest protobuf."""
     inner = (
-        _devin_encode_str(1, "chisel") +
-        _devin_encode_str(2, "2026.8.18") +
+        _devin_encode_str(1, DEVIN_CLIENT_NAME) +
+        _devin_encode_str(2, DEVIN_CLIENT_VERSION) +
         _devin_encode_str(3, at) +
-        _devin_encode_str(4, "en") +
-        _devin_encode_str(5, "mac") +
-        _devin_encode_str(7, "2026.8.18") +
-        _devin_encode_str(12, "chisel") +
-        _devin_encode_str(31, "080d03eeaa0cd7a10d0e0c84c26cb9a1c533e2675c14a85c3a971248f6521a710e4c02372539fc56c8b6a0454553533dc7f9e54fa3c16a2b141c87d0fb43a8b6a7e32b15a2267290298a6c6382e7b0096e06b41012d46d998f947b53a35b84c55ab589c683c6a3727aa5bf90c18e349fba8ac069b4121f5298fbacca590c903f169850ec072da539ed40d46f212aea973c725221098fcea6fb6fde32a7ef324003cb070e8a603c8c7a1d6743cfadd9e86f53797b32bb88b11abe8bcc98ec38473496bd9aaf482c6ab2c5def224bb7f554687cd78202159112e1cdee29b1c44b38cd407629d59c9dc0e2eab891ccacca859f358d7641acedc7fed0ba64a4d3e3a4827ac433bae69f7e48917ff2a6df24e2adf4fb9ed88ed8266228b99604a7cba3356fc28cb304de708958d188143f12eff3d52178a680c86073b21bc1efbf45a44b09887b60e9fe13ae9e5256e640b7159a595dcd5ecb2b470a290cf30357403e4a820dfb0ce990517e2cd64")
+        _devin_encode_str(4, DEVIN_CLIENT_LOCALE) +
+        _devin_encode_str(5, DEVIN_CLIENT_PLATFORM) +
+        _devin_encode_str(7, DEVIN_CLIENT_VERSION) +
+        _devin_encode_str(12, DEVIN_CLIENT_NAME) +
+        _devin_encode_str(31, DEVIN_CLIENT_FINGERPRINT)
     )
     return _devin_encode_varint((1 << 3) | 2) + _devin_encode_varint(len(inner)) + inner
 
@@ -833,8 +917,8 @@ def _devin_parse_response(raw):
             if sfn == 2 and swt == 'bytes':
                 try:
                     snap["plan"] = sval.decode('utf-8')
-                except:
-                    pass
+                except Exception as e:
+                    print(f"  devin: plan name decode failed: {e}")
 
     # Parse user_status (field 1) for quota info in field 13
     if user_status:
@@ -849,13 +933,13 @@ def _devin_parse_response(raw):
             if sfn == 7 and swt == 'bytes':
                 try:
                     snap["email"] = sval.decode('utf-8')
-                except:
-                    pass
+                except Exception as e:
+                    print(f"  devin: email decode failed: {e}")
             if sfn == 3 and swt == 'bytes':
                 try:
                     snap["name"] = sval.decode('utf-8')
-                except:
-                    pass
+                except Exception as e:
+                    print(f"  devin: name decode failed: {e}")
 
     # Set display fields from quota
     daily_pct = snap.get("daily_quota_remaining_percent")
@@ -938,16 +1022,24 @@ def _refresh_if_needed(conn, account, token):
         return token
     if token.get("expires_at") and token["expires_at"] - time.time() < 3600:
         try:
-            if provider == "antigravity":
-                client_id, client_secret = oauth._load_antigravity_creds()
-                oauth.ANTIGRAVITY["client_id"] = client_id
-                oauth.ANTIGRAVITY["client_secret"] = client_secret
-            result = oauth.REFRESH_FUNCS[provider](token["refresh_token"])
-            store.save_token(conn, account["id"], result["access_token"],
-                             result.get("refresh_token"), result.get("id_token"),
-                             result.get("expires_at"), result.get("raw"))
-            store.log_event(conn, account["id"], "token_refresh", True, "")
-            return store.get_token(conn, account["id"])
+            # Serialize refreshes across processes: refresh tokens rotate, so
+            # concurrent refreshes (daemon + on-demand poll) can invalidate
+            # each other. Inside the lock re-read the token and skip when it
+            # was already refreshed while we waited.
+            with work_queue.exclusive("token_refresh"):
+                token = store.get_token(conn, account["id"]) or token
+                if not (token.get("expires_at") and token["expires_at"] - time.time() < 3600):
+                    return token
+                if provider == "antigravity":
+                    client_id, client_secret = oauth._load_antigravity_creds()
+                    oauth.ANTIGRAVITY["client_id"] = client_id
+                    oauth.ANTIGRAVITY["client_secret"] = client_secret
+                result = oauth.REFRESH_FUNCS[provider](token["refresh_token"])
+                store.save_token(conn, account["id"], result["access_token"],
+                                 result.get("refresh_token"), result.get("id_token"),
+                                 result.get("expires_at"), result.get("raw"))
+                store.log_event(conn, account["id"], "token_refresh", True, "")
+                return store.get_token(conn, account["id"])
         except Exception as e:
             store.log_event(conn, account["id"], "token_refresh", False, str(e))
     return token
@@ -1171,9 +1263,16 @@ def run_loop(conn) -> int:
     # In-memory attempt times: copilot's hold-last-good path saves no snapshot
     # on a transient failure, so DB timestamps alone would re-poll it instantly.
     last_attempt: dict[int, float] = {}
+    next_prune = 0.0  # prune retention once at startup, then daily
     while True:
         try:
             now = time.time()
+            if now >= next_prune:
+                next_prune = now + 86400
+                try:
+                    store.prune_old_rows(conn)
+                except Exception as e:
+                    print(f"  retention prune failed: {e}")
             accounts = store.list_accounts(conn)
             _local_sync_tick(conn)
             if not accounts:
@@ -1248,28 +1347,34 @@ def redeem_reset(conn, account_id) -> int:
     except (ValueError, EOFError, KeyboardInterrupt):
         print("Cancelled")
         return 1
+    if not (0 <= idx < len(available)):
+        print(f"Invalid selection: {idx} (choose 0-{len(available) - 1})")
+        return 1
     credit = available[idx]
     import uuid
-    st, resp = _post(f"{WHAM}/wham/rate-limit-reset-credits/consume",
-                     {"credit_id": credit["credit_id"], "redeem_request_id": str(uuid.uuid4())},
-                     {"Authorization": f"Bearer {token['access_token']}",
-                      "ChatGPT-Account-Id": a["account_id"], "User-Agent": "agent-pool/1.0"})
-    if st == 200:
-        print(f"✓ Redeemed: {credit['title']}")
-        # Mark the credit as redeemed in the ledger before the re-poll wipes it
-        # from reset_credits, so it is never misclassified as expired_unused.
-        store.mark_credit_redeemed(conn, account_id, credit["credit_id"])
-        # Archive the closing windows now — before the confirmation re-poll —
-        # so the coupon row exists even if that re-poll fails.
-        try:
-            n = window_history.archive_coupon_redeem(conn, a, credit["credit_id"])
-            if n:
-                print(f"  ⤷ archived {n} window(s) as coupon reset")
-        except Exception as e:
-            print(f"  window-history archive failed: {e}")
-        # Re-poll to show updated state
-        poll_codex(conn, a, token)
-        return 0
-    else:
-        print(f"Redeem failed: HTTP {st} {resp}")
-        return 1
+    # Hold the poll lock through consume + ledger + re-poll so the daemon
+    # can't poll (and rewrite reset_credits) mid-redemption.
+    with work_queue.exclusive("poll"):
+        st, resp, _ = _post(f"{WHAM}/wham/rate-limit-reset-credits/consume",
+                         {"credit_id": credit["credit_id"], "redeem_request_id": str(uuid.uuid4())},
+                         {"Authorization": f"Bearer {token['access_token']}",
+                          "ChatGPT-Account-Id": a["account_id"], "User-Agent": "agent-pool/1.0"})
+        if st == 200:
+            print(f"✓ Redeemed: {credit['title']}")
+            # Mark the credit as redeemed in the ledger before the re-poll wipes it
+            # from reset_credits, so it is never misclassified as expired_unused.
+            store.mark_credit_redeemed(conn, account_id, credit["credit_id"])
+            # Archive the closing windows now — before the confirmation re-poll —
+            # so the coupon row exists even if that re-poll fails.
+            try:
+                n = window_history.archive_coupon_redeem(conn, a, credit["credit_id"])
+                if n:
+                    print(f"  ⤷ archived {n} window(s) as coupon reset")
+            except Exception as e:
+                print(f"  window-history archive failed: {e}")
+            # Re-poll to show updated state
+            poll_codex(conn, a, token)
+            return 0
+        else:
+            print(f"Redeem failed: HTTP {st} {resp}")
+            return 1

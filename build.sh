@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build and install the TokenStatusBar menu-bar app.
-set -e
+set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="TokenStatusBar"
 BUILD_DIR="$DIR/build"
@@ -12,12 +12,19 @@ INSTALL_DIR="/Applications/$APP_NAME.app"
 # Cached under build/python-standalone to avoid re-downloading.
 PY_VERSION="3.12.13"
 PY_RELEASE="20260623"
-PY_ARCH="aarch64-apple-darwin"
+case "$(uname -m)" in
+  arm64)  PY_ARCH="aarch64-apple-darwin" ;;
+  x86_64) PY_ARCH="x86_64-apple-darwin" ;;
+  *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+# Optional: set to the expected tarball SHA256 to verify the download.
+PY_SHA256="${PY_SHA256:-}"
 PY_TARBALL="cpython-${PY_VERSION}+${PY_RELEASE}-${PY_ARCH}-install_only_stripped.tar.gz"
 PY_URL="https://github.com/indygreg/python-build-standalone/releases/download/${PY_RELEASE}/${PY_TARBALL}"
 PY_CACHE="$BUILD_DIR/python-standalone"
 
 echo "Building $APP_NAME..."
+mkdir -p "$BUILD_DIR"
 swiftc -framework Cocoa -framework SwiftUI \
   "$DIR/app/TokenStatusBar.swift" \
   -o "$BUILD_DIR/$APP_NAME" \
@@ -31,6 +38,7 @@ cp "$BUILD_DIR/$APP_NAME" "$APP_DIR/Contents/MacOS/$APP_NAME"
 cp "$DIR/public/assets/icon/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 
 # Bundle backend Python scripts (stdlib-only, no third-party packages).
+rm -rf "$APP_DIR/Contents/Resources/backend"
 mkdir -p "$APP_DIR/Contents/Resources/backend"
 for f in "$DIR/backend/"*.py; do
   [[ "$(basename "$f")" == test_* ]] && continue
@@ -41,7 +49,14 @@ done
 if [[ ! -d "$PY_CACHE/python/bin" ]]; then
   echo "Fetching standalone Python ${PY_VERSION} (${PY_ARCH})..."
   mkdir -p "$PY_CACHE"
-  curl -sL -o "$BUILD_DIR/$PY_TARBALL" "$PY_URL"
+  curl --fail --show-error -sL -o "$BUILD_DIR/$PY_TARBALL" "$PY_URL"
+  if [[ -n "$PY_SHA256" ]]; then
+    echo "${PY_SHA256}  $BUILD_DIR/$PY_TARBALL" | shasum -a 256 -c - >/dev/null
+  else
+    echo "Warning: PY_SHA256 not set; skipping tarball checksum verification." >&2
+  fi
+  # Sanity-check the archive before extracting.
+  tar tzf "$BUILD_DIR/$PY_TARBALL" >/dev/null
   tar xzf "$BUILD_DIR/$PY_TARBALL" -C "$PY_CACHE"
   rm -f "$BUILD_DIR/$PY_TARBALL"
 fi
@@ -79,10 +94,15 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+# Ad-hoc sign so Gatekeeper/TCC treat the bundle consistently.
+# TODO: replace with a real Developer ID certificate + notarization for release.
+codesign --force --deep -s - "$APP_DIR"
+
 echo "Installing to $INSTALL_DIR..."
-# Remove any previous install (kill it first if running).
+# Quit any running instance gracefully before replacing it.
 if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
-    pkill -x "$APP_NAME" && sleep 1
+    osascript -e "tell application \"$APP_NAME\" to quit" || true
+    sleep 1
 fi
 rm -rf "$INSTALL_DIR"
 cp -R "$APP_DIR" "$INSTALL_DIR"
@@ -104,6 +124,16 @@ if [[ "${1:-}" == "--dmg" ]]; then
   ln -s /Applications "$STAGE/Applications"
   cp "$BG" "$STAGE/.background/background.png"
 
+  # Clean up the mounted volume and temp rw image if the DMG build fails.
+  VOL=""
+  dmg_cleanup() {
+    if [[ -n "$VOL" ]]; then
+      hdiutil detach "$VOL" -force >/dev/null 2>&1 || true
+    fi
+    rm -f "$RWDMG"
+  }
+  trap dmg_cleanup ERR
+
   hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -ov -format UDRW "$RWDMG" >/dev/null
   rm -rf "$STAGE"
 
@@ -111,6 +141,7 @@ if [[ "${1:-}" == "--dmg" ]]; then
   VOL="$(printf '%s\n' "$ATTACH_OUTPUT" | sed -n 's#^.*\(/Volumes/.*\)$#\1#p' | tail -n 1)"
   if [[ -z "$VOL" ]]; then
     echo "Unable to find mounted DMG volume." >&2
+    dmg_cleanup
     exit 1
   fi
   osascript \
@@ -133,8 +164,10 @@ if [[ "${1:-}" == "--dmg" ]]; then
 
   sleep 1
   hdiutil detach "$VOL" -force >/dev/null
+  VOL=""
   hdiutil convert "$RWDMG" -format UDZO -ov -o "$DMG" >/dev/null
   rm -f "$RWDMG"
+  trap - ERR
   echo "Built $DMG"
 fi
 

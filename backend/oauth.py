@@ -42,8 +42,16 @@ def open_browser(url: str, incognito: bool = False):
 class CallbackHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
-        params = urllib.parse.parse_qs(parsed.query)
-        self.server.result = {k: v[0] for k, v in params.items()}  # type: ignore
+        params = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+        expected = getattr(self.server, "expected_path", None)
+        # Only accept the registered callback path carrying OAuth params;
+        # anything else (favicon probes, scanners) gets a 404 and does not
+        # complete the flow.
+        if (expected and parsed.path != expected) or not ("code" in params or "error" in params):
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.server.result = params  # type: ignore
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.end_headers()
@@ -53,11 +61,17 @@ class CallbackHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def wait_for_callback(port: int, timeout: int = 300) -> dict:
-    """Start a local HTTP server on port, wait for OAuth callback, return params."""
-    server = http.server.HTTPServer(("127.0.0.1", port), CallbackHandler)
+def wait_for_callback(port: int, timeout: int = 300, host: str = "127.0.0.1",
+                      path: str | None = None) -> dict:
+    """Start a local HTTP server on host:port, wait for OAuth callback, return params.
+
+    host must match the registered redirect URI's host ("localhost" vs
+    "127.0.0.1") so the browser's resolution and our listener agree.
+    """
+    server = http.server.HTTPServer((host, port), CallbackHandler)
     server.timeout = 1
     server.result = None  # type: ignore
+    server.expected_path = path  # type: ignore
     deadline = time.time() + timeout
     while time.time() < deadline:
         server.handle_request()
@@ -161,7 +175,7 @@ def login_codex(incognito: bool = False) -> dict:
     auth_url = f"{CODEX['auth_url']}?{urllib.parse.urlencode(params)}"
     open_browser(auth_url, incognito)
     print("Waiting for Codex callback on port 1455...")
-    result = wait_for_callback(CODEX["port"])
+    result = wait_for_callback(CODEX["port"], host="localhost", path="/auth/callback")
     if result.get("error"):
         raise RuntimeError(f"Codex OAuth error: {result.get('error_description', result['error'])}")
     if result.get("state") != state:
@@ -235,7 +249,7 @@ def login_claude(incognito: bool = False) -> dict:
     auth_url = f"{CLAUDE['auth_url']}?{urllib.parse.urlencode(params)}"
     open_browser(auth_url, incognito)
     print(f"Waiting for Claude callback on port {CLAUDE['port']}...")
-    result = wait_for_callback(CLAUDE["port"])
+    result = wait_for_callback(CLAUDE["port"], host="localhost", path="/callback")
     if result.get("error"):
         raise RuntimeError(f"Claude OAuth error: {result.get('error_description', result['error'])}")
     if result.get("state") != state:
@@ -315,7 +329,7 @@ def login_xai(incognito: bool = False) -> dict:
     auth_url = f"{XAI['auth_url']}?{urllib.parse.urlencode(params)}"
     open_browser(auth_url, incognito)
     print(f"Waiting for xAI callback on port {XAI['port']}...")
-    result = wait_for_callback(XAI["port"])
+    result = wait_for_callback(XAI["port"], host="127.0.0.1", path="/callback")
     if result.get("error"):
         raise RuntimeError(f"xAI OAuth error: {result.get('error_description', result['error'])}")
     if result.get("state") != state:
@@ -375,6 +389,11 @@ def _load_antigravity_creds():
     env_path = os.path.join(data_dir, "antigravity.env")
     file_id, file_secret = "", ""
     try:
+        # Best-effort tighten: this file holds OAuth client credentials.
+        try:
+            os.chmod(env_path, 0o600)
+        except OSError:
+            pass
         with open(env_path) as f:
             for line in f:
                 line = line.strip()
@@ -427,7 +446,7 @@ def login_antigravity(incognito: bool = False) -> dict:
     auth_url = f"{ANTIGRAVITY['auth_url']}?{urllib.parse.urlencode(params)}"
     open_browser(auth_url, incognito)
     print(f"Waiting for Antigravity callback on port {ANTIGRAVITY['port']}...")
-    result = wait_for_callback(ANTIGRAVITY["port"])
+    result = wait_for_callback(ANTIGRAVITY["port"], host="localhost", path="/oauth-callback")
     if result.get("error"):
         raise RuntimeError(f"Antigravity OAuth error: {result.get('error_description', result['error'])}")
     if result.get("state") != state:
@@ -591,6 +610,8 @@ def login_devin(api_key: str) -> dict:
     # Validate the key by fetching org info
     st, resp = http_get("https://api.devin.ai/v1/user",
                         {"Authorization": f"Bearer {api_key}", "User-Agent": UA})[:2]
+    if st != 200:
+        raise RuntimeError(f"Devin API key validation failed: HTTP {st}: {str(resp)[:120]}")
     email = ""
     org_id = ""
     if isinstance(resp, dict):

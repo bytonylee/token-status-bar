@@ -44,10 +44,13 @@ availability dot per account, drill into a per-account submenu, or hit
 > which one still has quota, which is about to reset, and which token is about
 > to expire — without opening a dashboard.
 
-**The backend is a launchd daemon that polls every 5 minutes and writes
-`status.json`; the Swift app reads it every 30 seconds. Onboarding runs OAuth
-in Terminal via a one-click `Add New Agent` menu item. No scraping where a
-real API exists.**
+**The Python backend polls each provider and writes `secrets/status.json` —
+adaptive cadence: 5-minute base, 60-second polling for hot accounts, and a
+~15-second local session sync; the Swift app reads it every 30 seconds.
+Onboarding is a one-click `Add New Agent` menu item: browser-OAuth providers
+launch the OAuth flow directly, GitHub Copilot opens Terminal to show its
+device code, and Devin asks for its API key in an in-app prompt. No scraping
+where a real API exists.**
 
 ## Features
 
@@ -55,9 +58,10 @@ real API exists.**
   dot per account.
 - Per-account submenu with plan, status, token expiry, and quota windows.
 - Real-time quota for every supported provider (no scraping where an API exists).
-- Background poller (launchd daemon, 5-minute interval) plus on-demand **Poll Now**.
-- One-click **Add New Agent** onboarding that launches the OAuth / API-key flow
-  in Terminal.
+- Background poller (5-minute base interval, 60-second hot polling, ~15-second
+  local sync) plus on-demand **Poll Now**.
+- One-click **Add New Agent** onboarding — browser OAuth in the background,
+  Copilot's device-code flow in Terminal, Devin via an in-app API-key prompt.
 
 ## Supported providers
 
@@ -85,7 +89,7 @@ real API exists.**
 
 Two pipelines: **onboarding** (connect an account over OAuth) writes tokens to
 `pool.db`; **polling** reads those tokens, calls each provider's quota API, and
-writes `status.json` for the app to render.
+writes `secrets/status.json` for the app to render.
 
 ### Flow
 
@@ -101,7 +105,7 @@ flowchart TD
     F --> G
     G --> H[(pool.db)]
 
-    I[launchd daemon<br/>every 5 min] --> J[poller.run_loop]
+    I[poll-loop daemon<br/>5-min base, 60s hot] --> J[poller.run_loop]
     K["Poll Now<br/>(on demand)"] --> L[poller.run_once]
     J --> M[for each account]
     L --> M
@@ -137,7 +141,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A["launchd daemon (every 5 min)"] --> B[pool.py poll-loop → poller.run_loop]
+    A["poll-loop daemon (5-min base, 60s hot)"] --> B[pool.py poll-loop → poller.run_loop]
     C["Poll Now (on demand)"] --> D[pool.py poll → poller.run_once]
     B --> E[for each account in store.list_accounts]
     D --> E
@@ -170,10 +174,10 @@ flowchart TD
 | `backend/status.py`  | Writes `status.json` for the app to read. |
 | `backend/store.py`   | SQLite storage (`pool.db`). |
 | `backend/oauth.py`   | OAuth / device-flow login per provider. |
-| `status.json`        | Snapshot consumed by the menu-bar app (git-ignored). |
-| `pool.db`            | SQLite account/quota store (git-ignored). |
+| `secrets/status.json` | Snapshot consumed by the menu-bar app (git-ignored). |
+| `secrets/pool.db`    | SQLite account/quota store (git-ignored). |
 
-Data lives under `~/solo/token-status-bar/` by default (`pool.db`,
+Data lives under `~/solo/token-status-bar/secrets/` by default (`pool.db`,
 `status.json`). Override with the `AGENT_POOL_DB` and `AGENT_POOL_STATUS_JSON`
 environment variables.
 
@@ -184,8 +188,8 @@ environment variables.
 open /Applications/TokenStatusBar.app
 ```
 
-The app reads `status.json` every 30 seconds and shows a chart icon in the menu
-bar.
+The app reads `secrets/status.json` every 30 seconds and shows a chart icon in
+the menu bar.
 
 ## CLI usage
 
@@ -196,23 +200,32 @@ python3 backend/pool.py list                     # list all accounts
 python3 backend/pool.py remove <account_id>
 python3 backend/pool.py status                   # accounts + latest limit status
 python3 backend/pool.py poll                     # one poll cycle (hits all APIs)
-python3 backend/pool.py poll-loop                # run the poller daemon (5-min interval)
+python3 backend/pool.py poll-loop                # run the poller daemon (5-min base interval)
 python3 backend/pool.py refresh <account_id>     # refresh one token
 python3 backend/pool.py refresh-all              # refresh all expiring tokens
 python3 backend/pool.py export-status            # write status.json
 ```
 
-## Background poller (launchd)
+## Background poller (launchd, manual setup)
 
-A launchd agent at
-`~/Library/LaunchAgents/com.tonye.agentpool-poller.plist` runs
-`backend/pool.py poll-loop` and keeps `status.json` fresh.
+No launchd plist ships with this repo — the background poller is a manual
+setup. To keep `secrets/status.json` fresh, create
+`~/Library/LaunchAgents/com.tonye.agentpool-poller.plist` yourself with a
+`ProgramArguments` entry that runs `python3 <repo>/backend/pool.py poll-loop`
+and `RunAtLoad`/`KeepAlive` set to true, then load it:
+
+```bash
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.tonye.agentpool-poller.plist
+```
 
 After editing `poller.py`, restart the daemon so it loads the new code:
 
 ```bash
 launchctl kickstart -k "gui/$(id -u)/com.tonye.agentpool-poller"
 ```
+
+Alternatively, skip launchd and run `python3 backend/pool.py poll-loop` in any
+terminal session (or rely on the menu's **Poll Now**).
 
 ## Poll Now vs Refresh Display
 

@@ -6,7 +6,9 @@ Usage:
                                        provider: codex|claude|xai|antigravity|copilot|devin
                                        --incognito: open a private browser window (use when
                                                     adding a 2nd account on the same provider)
-  pool.py add-devin <api_key> [label]  Add Devin account by API key
+  pool.py add-devin [api_key] [label]  Add Devin account by API key (omit the key
+                                       to read it from stdin, or a getpass prompt
+                                       when run interactively)
   pool.py reconnect <account_id> [api_key] [--incognito]
                                       Reconnect an existing account in place
   pool.py list                         List all accounts
@@ -23,6 +25,7 @@ Usage:
   pool.py export-status                Write status JSON for the menu bar app
   pool.py dashboard [--open]           Regenerate history/dashboard.html (--open opens it)
   pool.py backfill-history             Archive historical windows from limit_snapshots
+  pool.py vacuum                       Prune old snapshots/logs and VACUUM the database
 """
 from __future__ import annotations
 import json, os, sys, time, datetime
@@ -42,6 +45,17 @@ def human_secs(s):
     if s < 3600: return f"{s//60}m"
     if s < 86400: return f"{s/3600:.1f}h"
     return f"{s/86400:.1f}d"
+
+
+def _read_api_key(prompt="API key: ") -> str:
+    """Read an API key from stdin (piped) or a hidden interactive prompt."""
+    if not sys.stdin.isatty():
+        return sys.stdin.readline().strip()
+    import getpass
+    try:
+        return getpass.getpass(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        return ""
 
 
 # ─── add ───────────────────────────────────────────────────────────────────
@@ -78,6 +92,11 @@ def cmd_add(provider, label=None, incognito=False):
 
 
 def cmd_add_devin(api_key, label=None):
+    if not api_key:
+        api_key = _read_api_key("Devin API key: ")
+    if not api_key:
+        print("usage: pool.py add-devin [api_key] [label] (or pipe the key via stdin)")
+        return 1
     label = label or "devin #1"
     print(f"\n=== Onboarding {label} (devin) ===")
     try:
@@ -113,7 +132,9 @@ def cmd_reconnect(account_id, api_key=None, incognito=False):
     try:
         if provider == "devin":
             if not api_key:
-                print("usage: pool.py reconnect <account_id> <api_key>")
+                api_key = _read_api_key("Devin API key: ")
+            if not api_key:
+                print("usage: pool.py reconnect <account_id> [api_key] (or pipe the key via stdin)")
                 return 1
             result = oauth.login_devin(api_key)
         else:
@@ -178,32 +199,70 @@ def cmd_remove(account_id):
 
 # ─── refresh ───────────────────────────────────────────────────────────────
 def cmd_refresh(account_id):
-    a = store.get_account(DB, int(account_id))
+    aid = int(account_id)
+    a = store.get_account(DB, aid)
     if not a:
         print(f"Account {account_id} not found")
         return 1
-    tok = store.get_token(DB, int(account_id))
-    if not tok or not tok["refresh_token"]:
-        print(f"No refresh token for account {account_id}")
+    tok = store.get_token(DB, aid)
+    if not tok:
+        print(f"No token for account {account_id}")
         return 1
     provider = a["provider"]
+    if provider == "copilot":
+        # Copilot has no OAuth refresh token; re-exchange the long-lived
+        # github token for a fresh copilot token instead.
+        return _refresh_copilot(aid, a, tok)
+    if not tok["refresh_token"]:
+        print(f"No refresh token for account {account_id}")
+        return 1
     if provider not in oauth.REFRESH_FUNCS:
         print(f"No refresh function for {provider}")
         return 1
     try:
-        if provider == "antigravity":
-            client_id, client_secret = oauth._load_antigravity_creds()
-            oauth.ANTIGRAVITY["client_id"] = client_id
-            oauth.ANTIGRAVITY["client_secret"] = client_secret
-        result = oauth.REFRESH_FUNCS[provider](tok["refresh_token"])
-        store.save_token(DB, int(account_id), result["access_token"],
-                         result.get("refresh_token"), result.get("id_token"),
-                         result.get("expires_at"), result.get("raw"))
-        store.log_event(DB, int(account_id), "token_refresh", True, "")
+        before = tok["last_refresh"]
+        # Serialize refreshes across processes: refresh tokens rotate, so a
+        # concurrent daemon refresh would invalidate the one we hold.
+        with work_queue.exclusive("token_refresh"):
+            tok = store.get_token(DB, aid) or tok
+            if (tok["last_refresh"] != before and tok["expires_at"]
+                    and tok["expires_at"] > time.time()):
+                print(f"✓ Token already refreshed by another process for {provider} / {a['email']}")
+                return 0
+            if provider == "antigravity":
+                client_id, client_secret = oauth._load_antigravity_creds()
+                oauth.ANTIGRAVITY["client_id"] = client_id
+                oauth.ANTIGRAVITY["client_secret"] = client_secret
+            result = oauth.REFRESH_FUNCS[provider](tok["refresh_token"])
+            store.save_token(DB, aid, result["access_token"],
+                             result.get("refresh_token"), result.get("id_token"),
+                             result.get("expires_at"), result.get("raw"))
+        store.log_event(DB, aid, "token_refresh", True, "")
         print(f"✓ Refreshed {provider} / {a['email']}")
         return 0
     except Exception as e:
-        store.log_event(DB, int(account_id), "token_refresh", False, str(e))
+        store.log_event(DB, aid, "token_refresh", False, str(e))
+        print(f"Refresh failed: {e}")
+        return 1
+
+
+def _refresh_copilot(aid, a, tok):
+    raw = json.loads(tok["raw_json"]) if tok["raw_json"] else {}
+    github_token = raw.get("github_token") or tok["access_token"]
+    if not github_token:
+        print(f"No GitHub token for account {aid}")
+        return 1
+    try:
+        result = oauth.refresh_copilot(github_token)
+        raw["copilot_token"] = result.get("copilot_token", "")
+        raw["copilot_expires_at"] = result.get("expires_at", 0)
+        store.save_token(DB, aid, github_token, None, "",
+                         result.get("expires_at") or (time.time() + 7200), raw)
+        store.log_event(DB, aid, "token_refresh", True, "")
+        print(f"✓ Refreshed copilot / {a['email']}")
+        return 0
+    except Exception as e:
+        store.log_event(DB, aid, "token_refresh", False, str(e))
         print(f"Refresh failed: {e}")
         return 1
 
@@ -254,10 +313,11 @@ def main(argv):
             return 1
         return cmd_add(args[0], args[1] if len(args) > 1 else None, incognito)
     if cmd == "add-devin":
-        if len(argv) < 2:
-            print("usage: pool.py add-devin <api_key> [label]")
-            return 1
-        return cmd_add_devin(argv[1], argv[2] if len(argv) > 2 else None)
+        # Back-compat: pool.py add-devin <api_key> [label].
+        # With no key (or "-"), the key is read from stdin / a getpass prompt.
+        if len(argv) >= 2 and argv[1] != "-":
+            return cmd_add_devin(argv[1], argv[2] if len(argv) > 2 else None)
+        return cmd_add_devin(None, argv[2] if len(argv) > 2 else None)
     if cmd == "reconnect":
         args = argv[1:]
         incognito = False
@@ -335,6 +395,11 @@ def main(argv):
             print("usage: pool.py reset <account_id>")
             return 1
         return poller.redeem_reset(DB, int(argv[1]))
+    if cmd == "vacuum":
+        n_snap, n_log = store.prune_old_rows(DB)
+        DB.execute("VACUUM")
+        print(f"Pruned {n_snap} old snapshot(s), {n_log} old log row(s); database vacuumed.")
+        return 0
     if cmd == "set-tier":
         if len(argv) < 3:
             print("usage: pool.py set-tier <account_id> <tier>")

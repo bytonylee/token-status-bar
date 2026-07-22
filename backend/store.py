@@ -146,10 +146,16 @@ CREATE TABLE IF NOT EXISTS live_activity (
 
 
 def connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(DB_PATH.parent, 0o700)
+    except OSError:
+        pass
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
     # migrate: add granted_at / description if missing (older DBs)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(reset_credits)")}
@@ -191,7 +197,27 @@ def connect() -> sqlite3.Connection:
     ]:
         if col not in mcols:
             conn.execute(f"ALTER TABLE subscription_meta ADD COLUMN {col} {decl}")
+    conn.commit()
+    try:
+        os.chmod(DB_PATH, 0o600)
+    except OSError:
+        pass
     return conn
+
+
+SNAPSHOT_RETENTION_DAYS = 90
+REFRESH_LOG_RETENTION_DAYS = 30
+
+
+def prune_old_rows(conn, snapshot_days=SNAPSHOT_RETENTION_DAYS,
+                   log_days=REFRESH_LOG_RETENTION_DAYS) -> tuple[int, int]:
+    """Delete old limit_snapshots / refresh_log rows. Returns rows deleted."""
+    snap_cut = now() - snapshot_days * 86400
+    log_cut = now() - log_days * 86400
+    n_snap = conn.execute("DELETE FROM limit_snapshots WHERE ts < ?", (snap_cut,)).rowcount
+    n_log = conn.execute("DELETE FROM refresh_log WHERE ts < ?", (log_cut,)).rowcount
+    conn.commit()
+    return n_snap, n_log
 
 
 def now() -> float:

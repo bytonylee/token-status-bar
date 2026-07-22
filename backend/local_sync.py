@@ -27,6 +27,14 @@ CLAUDE_TAIL_BYTES = 262144
 _last_event: dict = {}
 
 
+def _as_int(v) -> int:
+    """int(v), or 0 when the value is missing or non-numeric."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _iso_epoch(s) -> float | None:
     if not s:
         return None
@@ -64,12 +72,13 @@ def _codex_recent_files(now: float) -> list[Path]:
             continue
         for p in day_dir.glob("*.jsonl"):
             try:
-                if now - p.stat().st_mtime <= RECENT_S:
-                    out.append(p)
+                mtime = p.stat().st_mtime
             except OSError:
-                continue
-    out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return out
+                continue  # deleted between glob and stat
+            if now - mtime <= RECENT_S:
+                out.append((mtime, p))
+    out.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in out]
 
 
 def extract_token_count(obj) -> dict | None:
@@ -125,6 +134,18 @@ def codex_snap(rl) -> dict:
     return snap
 
 
+def context_used_pct(context_window, total_tokens) -> float | None:
+    """Live context percentage, or None when either value is missing,
+    non-numeric, or non-positive (a zero window must never divide)."""
+    try:
+        cw, total = float(context_window), float(total_tokens)
+    except (TypeError, ValueError):
+        return None
+    if cw <= 0 or total <= 0:
+        return None
+    return round(min(100.0, 100.0 * total / cw), 1)
+
+
 def _scan_codex(conn, accounts, now: float) -> bool:
     account = match_codex_account(accounts, codex_active_account_id())
     if not account:
@@ -168,8 +189,9 @@ def _scan_codex(conn, accounts, now: float) -> bool:
                 "last_cached_tokens": last.get("cached_input_tokens"),
                 "last_output_tokens": last.get("output_tokens")}
         if cw and last.get("total_tokens"):
-            live["context_used_pct"] = round(
-                min(100.0, 100.0 * last["total_tokens"] / cw), 1)
+            pct = context_used_pct(cw, last.get("total_tokens"))
+            if pct is not None:
+                live["context_used_pct"] = pct
         store.upsert_live_activity(conn, account["id"], live)
         _last_event[key] = ev_iso
         return True
@@ -198,9 +220,9 @@ def claude_usage_totals(lines, since_epoch: float) -> dict:
             last_epoch = ts
         if ts < since_epoch:
             continue
-        total += int(usage.get("input_tokens") or 0)
-        total += int(usage.get("output_tokens") or 0)
-        total += int(usage.get("cache_creation_input_tokens") or 0)
+        total += _as_int(usage.get("input_tokens"))
+        total += _as_int(usage.get("output_tokens"))
+        total += _as_int(usage.get("cache_creation_input_tokens"))
     return {"tokens_60m": total, "last_event_epoch": last_epoch}
 
 

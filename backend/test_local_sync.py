@@ -102,6 +102,33 @@ class ClaudeUsageTotalsTest(unittest.TestCase):
         self.assertAlmostEqual(totals["last_event_epoch"],
                                local_sync._iso_epoch("2026-07-16T13:30:00.000Z"))
 
+    def test_skips_nonnumeric_usage_without_crashing(self):
+        lines = [json.dumps({
+            "type": "assistant", "timestamp": "2026-07-16T13:30:00.000Z",
+            "message": {"usage": {"input_tokens": "lots", "output_tokens": None,
+                                  "cache_creation_input_tokens": {"oops": 1}}}}),
+                 json.dumps({
+            "type": "assistant", "timestamp": "2026-07-16T13:31:00.000Z",
+            "message": {"usage": {"input_tokens": 100, "output_tokens": 50}}})]
+        totals = local_sync.claude_usage_totals(lines, 0.0)
+        self.assertEqual(totals["tokens_60m"], 150)  # malformed record contributes 0
+
+
+class ContextUsedPctTests(unittest.TestCase):
+    def test_normal(self):
+        self.assertEqual(local_sync.context_used_pct(200000, 50000), 25.0)
+
+    def test_zero_window_returns_none(self):
+        self.assertIsNone(local_sync.context_used_pct(0, 50000))
+
+    def test_negative_or_nonnumeric_returns_none(self):
+        self.assertIsNone(local_sync.context_used_pct(-1, 50000))
+        self.assertIsNone(local_sync.context_used_pct("big", 50000))
+        self.assertIsNone(local_sync.context_used_pct(200000, None))
+
+    def test_caps_at_100(self):
+        self.assertEqual(local_sync.context_used_pct(1000, 5000), 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,9 +14,14 @@ from window_history import HISTORY_DIR, fmt_local
 def dashboard_data(conn) -> list[dict]:
     rows = []
     for r in store.list_window_history(conn):
-        if r["window_kind"] == "5h":
+        if r["window_kind"].startswith("5h"):
             continue  # 5h windows reset often and dwarf the weekly/monthly signal
-        details = json.loads(r["details"]) if r["details"] else {}
+        try:
+            details = json.loads(r["details"]) if r["details"] else {}
+        except (TypeError, ValueError):
+            details = {}  # one corrupt row must not break the whole dashboard
+        if not isinstance(details, dict):
+            details = {}
         rows.append({
             "provider": r["provider"],
             "account": r["email"] or r["label"] or f"#{r['account_id']}",
@@ -41,7 +46,8 @@ def dashboard_data(conn) -> list[dict]:
         acct = a["email"] or a["label"] or f"#{a['id']}"
         for w in (window_history.timed_windows(a["provider"], snap)
                   + window_history.drop_windows(a["provider"], snap)):
-            if w["kind"] in ("5h", "daily", "monthly", "monthly_premium", "monthly_chat"):
+            if w["kind"].startswith("5h") or w["kind"] in (
+                    "daily", "monthly", "monthly_premium", "monthly_chat"):
                 continue
             if w.get("used_pct") is None:
                 continue
@@ -84,13 +90,13 @@ def coupon_data(conn) -> list[dict]:
 
 def generate(conn):
     """Write history/dashboard.html and return its path."""
-    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    window_history.ensure_history_dir()
     path = HISTORY_DIR / "dashboard.html"
     data = json.dumps(dashboard_data(conn)).replace("</", "<\\/")
     coupons = json.dumps(coupon_data(conn)).replace("</", "<\\/")
     html = _HTML_TEMPLATE.replace("/*__DATA__*/[]", data)
     html = html.replace("/*__COUPONS__*/[]", coupons)
-    path.write_text(html)
+    window_history.atomic_write_text(path, html)
     return path
 
 
@@ -411,8 +417,9 @@ function renderChart(rows) {
     svg.appendChild(p);
     // sparse rotated time labels
     if (i % step === 0 || i === n - 1) {
-      const lab = (r.window_end_label || "").slice(5, 16); // MM-DD HH:MM
-      if (lab && lab !== "going") {
+      // ongoing rows have no close time ("ongoing" would slice to "ng")
+      const lab = r.ongoing ? "" : (r.window_end_label || "").slice(5, 16); // MM-DD HH:MM
+      if (lab) {
         const tx = svgEl("text", { x: cx, y: mT + plotH + 14,
           "text-anchor": "end",
           transform: "rotate(-35 " + cx + " " + (mT + plotH + 14) + ")" });

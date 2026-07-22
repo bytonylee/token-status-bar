@@ -553,8 +553,12 @@ def project_exhaust(points, reset_at, now) -> float | None:
     (t0, u0), (t1, u1) = segment[0], segment[-1]
     if t1 <= t0 or u1 <= u0:
         return None
+    if u1 >= 100.0:
+        return None  # already exhausted
     rate = (u1 - u0) / (t1 - t0)  # pct per second
     exhaust = t1 + (100.0 - u1) / rate
+    if exhaust <= now:
+        return None  # projection in the past is meaningless
     return exhaust if exhaust < reset_at else None
 
 
@@ -672,7 +676,7 @@ def cmd_export(conn) -> int:
             "provider": a["provider"],
             "email": a["email"],
             "label": a["label"],
-            "plan": snap["plan"] if snap else a["plan"],
+            "plan": (snap.get("plan") or a["plan"]) if snap else a["plan"],
             "status": snap["status"] if snap else "unknown",
             "status_message": snap["status_message"] if snap else "",
             "token_expires": ts_fmt(tok["expires_at"]) if tok else None,
@@ -722,13 +726,28 @@ def cmd_export(conn) -> int:
             live["as_of_epoch"] = float(live.pop("ts"))
             items[-1]["live"] = live
     payload = {
-        "generated_at": datetime.datetime.now().isoformat(),
+        # Computed from an aware datetime, then rendered in local time without
+        # an offset — the exact naive-local format the Swift app parses.
+        "generated_at": datetime.datetime.now(datetime.timezone.utc)
+                        .astimezone().replace(tzinfo=None).isoformat(),
         "account_count": len(items),
         "heartbeat": heartbeat_summary(items),
         "headline": select_headline(items),
         "accounts": items,
     }
     STATUS_JSON.parent.mkdir(parents=True, exist_ok=True)
-    STATUS_JSON.write_text(json.dumps(payload, indent=2))
+    # Atomic replace so readers (Swift app polls every 30s) never see a
+    # partially written file; 0o600 keeps account data private.
+    tmp = STATUS_JSON.with_name(STATUS_JSON.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(payload, indent=2))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATUS_JSON)
+    try:
+        os.chmod(STATUS_JSON, 0o600)
+    except OSError:
+        pass
     print(f"Wrote {STATUS_JSON} ({len(items)} accounts)")
     return 0

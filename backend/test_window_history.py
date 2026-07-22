@@ -201,6 +201,37 @@ class DetectTimedWindowTests(unittest.TestCase):
         self.assertEqual(out[0].reset_cause, "natural")
         self.assertEqual(out[0].window_end, BASE + 400)
 
+    def test_weekly_primary_window_classified_by_duration(self):
+        # A weekly-primary snapshot (primary_window_s = 604800) must be
+        # classified "weekly" from its duration, never hard-coded "5h".
+        snap = _snap(BASE, primary_used_pct=42.0, primary_reset_at=BASE + 86400,
+                     primary_window_s=604800)
+        wins = window_history.timed_windows("codex", snap)
+        self.assertEqual([w["kind"] for w in wins], ["weekly"])
+
+    def test_antigravity_usage_windows_are_detected(self):
+        raw = json.dumps({"extra": {"usage_windows": [
+            {"group": "gemini", "window": "5h", "remaining_pct": 20.0,
+             "reset_at": BASE + 400},
+            {"group": "gemini", "window": "weekly", "remaining_pct": 55.0,
+             "reset_at": BASE + 90000},
+            {"group": "other", "window": "5h", "remaining_pct": 100.0,
+             "reset_at": None},  # no reset ts -> not a timed window
+        ]}})
+        prev = _snap(BASE, raw_json=raw)
+        wins = {w["kind"]: w for w in window_history.timed_windows("antigravity", prev)}
+        self.assertEqual(set(wins), {"5h_gemini", "weekly_gemini"})
+        self.assertAlmostEqual(wins["5h_gemini"]["used_pct"], 80.0)
+        # a roll of the gemini 5h group window closes it
+        new = _snap(BASE + 700, raw_json=json.dumps({"extra": {"usage_windows": [
+            {"group": "gemini", "window": "5h", "remaining_pct": 99.0,
+             "reset_at": BASE + 400 + 18000}]}}))
+        out = window_history.detect_closed_windows("antigravity", prev, new)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].window_kind, "5h_gemini")
+        self.assertEqual(out[0].reset_cause, "natural")
+        self.assertEqual(out[0].window_end, BASE + 400)
+
     def test_nonnumeric_reset_at_skips_window_not_crash(self):
         # A malformed reset_at (an unparsed date string) must skip that window
         # rather than raise inside float() and abort the whole account's sweep.

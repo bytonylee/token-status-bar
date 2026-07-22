@@ -43,17 +43,22 @@
 > 리셋되는지, 어떤 토큰이 곧 만료하는지 한눈에 보고 싶은 사람을 위해
 > 만들었습니다 — 대시보드를 따로 열 필요 없이.
 
-**백엔드는 launchd 데몬으로 5분마다 폴링해 `status.json`을 기록하고, Swift
-앱은 30초마다 이를 읽습니다. 온보딩은 `Add New Agent` 메뉴 한 번으로
-터미널에서 OAuth를 실행합니다. 진짜 API가 있으면 스크래핑하지 않습니다.**
+**Python 백엔드는 각 제공자를 폴링해 `secrets/status.json`을 기록합니다 —
+기본 5분 주기에, 사용량이 많은(hot) 계정은 60초, 로컬 세션 동기화는 약
+15초의 적응형 주기입니다. Swift 앱은 이를 30초마다 읽습니다. 온보딩은
+`Add New Agent` 메뉴 한 번으로 실행됩니다: 브라우저 OAuth 제공자는 바로
+OAuth 플로우를 열고, GitHub Copilot은 디바이스 코드를 보여주기 위해
+터미널을 열며, Devin은 앱 안의 프롬프트로 API 키를 입력받습니다. 진짜
+API가 있으면 스크래핑하지 않습니다.**
 
 ## 기능
 
 - 제공자별로 묶인 드롭다운 메뉴와 계정마다 초록 / 노랑 / 빨강 가용성 점 표시.
 - 계정별 하위 메뉴에 요금제, 상태, 토큰 만료, 쿼터 윈도우 표시.
 - 지원하는 모든 제공자의 실시간 쿼터 조회(API가 있는 경우 스크래핑하지 않음).
-- 백그라운드 폴러(launchd 데몬, 5분 주기)와 즉시 실행용 **Poll Now**.
-- **Add New Agent** 한 번으로 OAuth / API 키 온보딩을 터미널에서 실행.
+- 백그라운드 폴러(기본 5분 주기, hot 계정 60초, 로컬 동기화 약 15초)와 즉시 실행용 **Poll Now**.
+- **Add New Agent** 한 번으로 온보딩 — 브라우저 OAuth는 백그라운드에서,
+  Copilot 디바이스 코드 플로우는 터미널에서, Devin은 앱 내 API 키 입력으로 실행.
 
 ## 지원 제공자
 
@@ -81,7 +86,7 @@
 
 두 개의 파이프라인이 있습니다. **온보딩**(OAuth로 계정 연결)은 토큰을
 `pool.db`에 저장하고, **폴링**은 그 토큰으로 각 제공자의 쿼터 API를 호출해
-앱이 표시할 `status.json`을 생성합니다.
+앱이 표시할 `secrets/status.json`을 생성합니다.
 
 ### 흐름도
 
@@ -97,7 +102,7 @@ flowchart TD
     F --> G
     G --> H[(pool.db)]
 
-    I[launchd 데몬<br/>5분 주기] --> J[poller.run_loop]
+    I[poll-loop 데몬<br/>기본 5분, hot 60초] --> J[poller.run_loop]
     K["Poll Now<br/>(즉시 실행)"] --> L[poller.run_once]
     J --> M[각 계정마다]
     L --> M
@@ -133,7 +138,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A["launchd 데몬 (5분 주기)"] --> B[pool.py poll-loop → poller.run_loop]
+    A["poll-loop 데몬 (기본 5분, hot 60초)"] --> B[pool.py poll-loop → poller.run_loop]
     C["Poll Now (즉시 실행)"] --> D[pool.py poll → poller.run_once]
     B --> E[store.list_accounts 각 계정마다]
     D --> E
@@ -166,10 +171,10 @@ flowchart TD
 | `backend/status.py`  | 앱이 읽을 `status.json` 생성. |
 | `backend/store.py`   | SQLite 저장소 (`pool.db`). |
 | `backend/oauth.py`   | 제공자별 OAuth / 디바이스 플로우 로그인. |
-| `status.json`        | 메뉴 막대 앱이 사용하는 스냅샷 (git 무시). |
-| `pool.db`            | SQLite 계정/쿼터 저장소 (git 무시). |
+| `secrets/status.json` | 메뉴 막대 앱이 사용하는 스냅샷 (git 무시). |
+| `secrets/pool.db`    | SQLite 계정/쿼터 저장소 (git 무시). |
 
-데이터는 기본적으로 `~/solo/token-status-bar/` 아래에 저장됩니다(`pool.db`,
+데이터는 기본적으로 `~/solo/token-status-bar/secrets/` 아래에 저장됩니다(`pool.db`,
 `status.json`). `AGENT_POOL_DB`, `AGENT_POOL_STATUS_JSON` 환경 변수로 경로를
 바꿀 수 있습니다.
 
@@ -180,7 +185,7 @@ flowchart TD
 open /Applications/TokenStatusBar.app
 ```
 
-앱은 30초마다 `status.json`을 읽고 메뉴 막대에 차트 아이콘을 표시합니다.
+앱은 30초마다 `secrets/status.json`을 읽고 메뉴 막대에 차트 아이콘을 표시합니다.
 
 ## CLI 사용법
 
@@ -191,22 +196,32 @@ python3 backend/pool.py list                     # 모든 계정 목록
 python3 backend/pool.py remove <account_id>
 python3 backend/pool.py status                   # 계정 + 최신 한도 상태
 python3 backend/pool.py poll                     # 1회 폴링 (모든 API 호출)
-python3 backend/pool.py poll-loop                # 폴러 데몬 실행 (5분 주기)
+python3 backend/pool.py poll-loop                # 폴러 데몬 실행 (기본 5분 주기)
 python3 backend/pool.py refresh <account_id>     # 토큰 1개 갱신
 python3 backend/pool.py refresh-all              # 만료 예정 토큰 전체 갱신
 python3 backend/pool.py export-status            # status.json 작성
 ```
 
-## 백그라운드 폴러 (launchd)
+## 백그라운드 폴러 (launchd, 수동 설정)
 
-`~/Library/LaunchAgents/com.tonye.agentpool-poller.plist`의 launchd 에이전트가
-`backend/pool.py poll-loop`를 실행하며 `status.json`을 최신 상태로 유지합니다.
+이 저장소에는 launchd plist가 포함되어 있지 않습니다 — 백그라운드 폴러는
+직접 설정해야 합니다. `secrets/status.json`을 최신 상태로 유지하려면
+`~/Library/LaunchAgents/com.tonye.agentpool-poller.plist`를 직접 만들어
+`ProgramArguments`에 `python3 <repo>/backend/pool.py poll-loop`를 지정하고
+`RunAtLoad`/`KeepAlive`를 true로 설정한 뒤 로드하세요:
+
+```bash
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.tonye.agentpool-poller.plist
+```
 
 `poller.py`를 수정한 뒤에는 새 코드를 반영하도록 데몬을 다시 시작하세요:
 
 ```bash
 launchctl kickstart -k "gui/$(id -u)/com.tonye.agentpool-poller"
 ```
+
+launchd 대신 아무 터미널 세션에서 `python3 backend/pool.py poll-loop`를
+실행하거나, 메뉴의 **Poll Now**만 사용해도 됩니다.
 
 ## Poll Now vs Refresh Display
 

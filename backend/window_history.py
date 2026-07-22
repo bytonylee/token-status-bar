@@ -7,7 +7,7 @@ them. Error snapshots never participate, so a connection failure can never
 fake or corrupt a reset.
 """
 from __future__ import annotations
-import csv, datetime, json, os, time, zoneinfo
+import csv, datetime, io, json, os, time, zoneinfo
 from dataclasses import dataclass, field
 from pathlib import Path
 import store
@@ -27,13 +27,61 @@ SUCCESS_STATUSES = ("active", "rate_limited")
 
 @dataclass
 class ClosedWindow:
-    window_kind: str            # 5h|weekly|weekly_fable|daily|monthly|monthly_premium|monthly_chat
+    window_kind: str            # 5h|weekly|weekly_fable|daily|monthly|monthly_premium|monthly_chat|{5h,weekly}_{gemini,other}
     window_start: float | None  # unix; reset_at - window_s when known
     window_end: float           # boundary the window closed at
     final_used_pct: float       # last successful reading before close
     final_snapshot_ts: float    # ts of the snapshot supplying it
     reset_cause: str            # natural|coupon|provider_reset|unknown
     details: dict = field(default_factory=dict)
+
+
+def _pct(v) -> float | None:
+    """float(v), or None when the value is missing or non-numeric."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _kind_from_window_s(window_s, default):
+    """Window kind from its duration (mirrors status._kind_from_window_s)."""
+    if not window_s:
+        return default
+    if 17000 <= window_s <= 19000:
+        return "5h"
+    if window_s == 86400:
+        return "daily"
+    if 500000 <= window_s < 1000000:
+        return "weekly"
+    if window_s >= 1000000:
+        return "monthly"
+    return default
+
+
+def ensure_history_dir() -> None:
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(HISTORY_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Temp file in the same dir + os.replace, mode 0o600: readers never see
+    a partially-written export."""
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _parse_iso_ts(s) -> float | None:
@@ -60,6 +108,35 @@ def _fable(snap) -> dict | None:
     return None
 
 
+def _agy_usage_windows(snap) -> list[dict]:
+    """Antigravity per-group 5h/weekly windows from raw_json extra (best-effort).
+
+    Poller stores agy_usage.fetch_usage() output under extra.usage_windows:
+    [{"group": "gemini"|"other", "window": "5h"|"weekly",
+      "remaining_pct": float, "reset_at": epoch_or_None}]
+    """
+    try:
+        rj = json.loads(snap.get("raw_json") or "{}")
+    except Exception:
+        return []
+    extra = rj.get("extra") if isinstance(rj, dict) else None
+    ws = extra.get("usage_windows") if isinstance(extra, dict) else None
+    out = []
+    for w in ws or []:
+        if not isinstance(w, dict):
+            continue
+        rem = _pct(w.get("remaining_pct"))
+        if rem is None or not w.get("reset_at"):
+            continue
+        window = "weekly" if w.get("window") == "weekly" else "5h"
+        group = w.get("group") or "other"
+        out.append({"kind": f"{window}_{group}",
+                    "used_pct": max(0.0, min(100.0, 100.0 - rem)),
+                    "reset_at": w["reset_at"],
+                    "window_s": 604800 if window == "weekly" else 18000})
+    return out
+
+
 def timed_windows(provider, snap) -> list[dict]:
     """Snapshot windows that carry a reset timestamp (detection rule 2)."""
     out: list[dict] = []
@@ -75,14 +152,19 @@ def timed_windows(provider, snap) -> list[dict]:
                     "window_s": window_s, "start": start})
 
     if provider in ("codex", "claude", "antigravity"):
-        add("5h", snap.get("primary_used_pct"), snap.get("primary_reset_at"),
+        add(_kind_from_window_s(snap.get("primary_window_s"), "5h"),
+            snap.get("primary_used_pct"), snap.get("primary_reset_at"),
             snap.get("primary_window_s"))
-        add("weekly", snap.get("secondary_used_pct"), snap.get("secondary_reset_at"),
+        add(_kind_from_window_s(snap.get("secondary_window_s"), "weekly"),
+            snap.get("secondary_used_pct"), snap.get("secondary_reset_at"),
             snap.get("secondary_window_s"))
         if provider == "claude":
             f = _fable(snap)
             if f:
                 add("weekly_fable", f.get("used_pct"), f.get("reset_at"), 604800)
+        if provider == "antigravity":
+            for w in _agy_usage_windows(snap):
+                add(w["kind"], w["used_pct"], w["reset_at"], w["window_s"])
     elif provider == "copilot":
         add("monthly_premium", snap.get("primary_used_pct"), snap.get("primary_reset_at"), None)
     elif provider == "xai":
@@ -98,17 +180,21 @@ def drop_windows(provider, snap) -> list[dict]:
     boundary is a unix ts hint or "midnight" for devin's daily window.
     """
     out: list[dict] = []
-    if provider == "copilot" and snap.get("secondary_used_pct") is not None:
-        out.append({"kind": "monthly_chat", "used_pct": float(snap["secondary_used_pct"]),
-                    "boundary": snap.get("primary_reset_at")})
+    if provider == "copilot":
+        used = _pct(snap.get("secondary_used_pct"))
+        if used is not None:
+            out.append({"kind": "monthly_chat", "used_pct": used,
+                        "boundary": snap.get("primary_reset_at")})
     elif provider == "devin":
-        if snap.get("daily_quota_remaining_percent") is not None:
+        daily_rem = _pct(snap.get("daily_quota_remaining_percent"))
+        if daily_rem is not None:
             out.append({"kind": "daily",
-                        "used_pct": 100.0 - float(snap["daily_quota_remaining_percent"]),
+                        "used_pct": 100.0 - daily_rem,
                         "boundary": "midnight"})
-        if snap.get("weekly_quota_remaining_percent") is not None:
+        weekly_rem = _pct(snap.get("weekly_quota_remaining_percent"))
+        if weekly_rem is not None:
             out.append({"kind": "weekly",
-                        "used_pct": 100.0 - float(snap["weekly_quota_remaining_percent"]),
+                        "used_pct": 100.0 - weekly_rem,
                         "boundary": snap.get("plan_reset_unix")})
     return out
 
@@ -124,7 +210,7 @@ def _near_boundary(prev_ts, new_ts, boundary_ts) -> bool:
 
 
 def _near_local_midnight(prev_ts, new_ts) -> bool:
-    day = datetime.datetime.fromtimestamp(new_ts).replace(
+    day = datetime.datetime.fromtimestamp(new_ts, tz=KST).replace(
         hour=0, minute=0, second=0, microsecond=0)
     return any(_near_boundary(prev_ts, new_ts, (day + datetime.timedelta(days=n)).timestamp())
                for n in (0, 1))
@@ -300,9 +386,10 @@ def _row_fields(cw: ClosedWindow, email, label) -> dict:
 
 def append_jsonl(account, closed) -> None:
     """O(1) per-account append: one JSON object per closed window."""
-    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_history_dir()
     path = HISTORY_DIR / f"{account['provider']}-{account['id']}.jsonl"
-    with open(path, "a") as f:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a") as f:
         for cw in closed:
             obj = _row_fields(cw, account.get("email"), account.get("label"))
             obj["details"] = cw.details
@@ -317,24 +404,30 @@ def write_provider_csv(conn, provider):
     rows = store.list_window_history(conn, provider=provider)
     if not rows:
         return None
-    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_history_dir()
     path = HISTORY_DIR / f"{provider}.csv"
-    with open(path, "w", newline="") as f:
-        wr = csv.DictWriter(f, fieldnames=list(CSV_FIELDS))
-        wr.writeheader()
-        for r in rows:
+    buf = io.StringIO()
+    wr = csv.DictWriter(buf, fieldnames=list(CSV_FIELDS))
+    wr.writeheader()
+    for r in rows:
+        try:
             details = json.loads(r["details"]) if r["details"] else {}
-            wr.writerow({
-                "email": r["email"] or "",
-                "label": r["label"] or "",
-                "window_kind": r["window_kind"],
-                "window_start": fmt_local(r["window_start"]),
-                "window_end": fmt_local(r["window_end"]),
-                "final_used_pct": r["final_used_pct"],
-                "reset_cause": r["reset_cause"],
-                "final_snapshot_ts": fmt_local(r["final_snapshot_ts"]),
-                "staleness_s": details.get("staleness_s", ""),
-            })
+        except (TypeError, ValueError):
+            details = {}  # one corrupt row must not break the whole export
+        if not isinstance(details, dict):
+            details = {}
+        wr.writerow({
+            "email": r["email"] or "",
+            "label": r["label"] or "",
+            "window_kind": r["window_kind"],
+            "window_start": fmt_local(r["window_start"]),
+            "window_end": fmt_local(r["window_end"]),
+            "final_used_pct": r["final_used_pct"],
+            "reset_cause": r["reset_cause"],
+            "final_snapshot_ts": fmt_local(r["final_snapshot_ts"]),
+            "staleness_s": details.get("staleness_s", ""),
+        })
+    atomic_write_text(path, buf.getvalue())
     return path
 
 

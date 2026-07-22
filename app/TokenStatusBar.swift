@@ -159,21 +159,36 @@ class StatusLoader: ObservableObject {
     @Published var payload: StatusPayload?
     @Published var lastError: String?
     private var timer: Timer?
+    // Serial queue for file I/O + JSON decode, off the main run loop.
+    private let ioQueue = DispatchQueue(label: "com.tonye.tokenstatusbar.status-io")
 
+    private let poolDir: String
     private let dataDir: String
     let statusURL: URL
 
     init() {
-        let dataDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("solo/token-status-bar/secrets").path
+        let env = ProcessInfo.processInfo.environment
+        let poolDir: String
+        if let override = env["AGENT_POOL_DIR"], !override.isEmpty {
+            poolDir = override
+        } else {
+            poolDir = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("solo/token-status-bar").path
+        }
+        self.poolDir = poolDir
+        let dataDir = "\(poolDir)/secrets"
         self.dataDir = dataDir
-        self.statusURL = URL(fileURLWithPath: dataDir).appendingPathComponent("status.json")
+        if let override = env["AGENT_POOL_STATUS_JSON"], !override.isEmpty {
+            self.statusURL = URL(fileURLWithPath: override)
+        } else {
+            self.statusURL = URL(fileURLWithPath: dataDir).appendingPathComponent("status.json")
+        }
     }
 
     func start() {
         reload()
-        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in
-            self.reload()
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            self?.reload()
         }
     }
 
@@ -183,24 +198,57 @@ class StatusLoader: ObservableObject {
     }
 
     func reload() {
-        guard FileManager.default.fileExists(atPath: statusURL.path) else {
-            DispatchQueue.main.async {
-                self.lastError = "No status.json yet. Run: pool.py poll"
+        ioQueue.async { [weak self] in
+            guard let self else { return }
+            guard FileManager.default.fileExists(atPath: self.statusURL.path) else {
+                DispatchQueue.main.async {
+                    self.lastError = "No status.json yet. Run: pool.py poll"
+                }
+                return
             }
-            return
+            do {
+                let data = try Data(contentsOf: self.statusURL)
+                let decoded = try JSONDecoder().decode(StatusPayload.self, from: data)
+                DispatchQueue.main.async {
+                    self.payload = decoded
+                    self.lastError = nil
+                }
+            } catch {
+                // Keep the cached payload; surface the failure via statusWarning.
+                DispatchQueue.main.async {
+                    self.lastError = "Parse error: \(error.localizedDescription)"
+                }
+            }
         }
-        do {
-            let data = try Data(contentsOf: statusURL)
-            let decoded = try JSONDecoder().decode(StatusPayload.self, from: data)
-            DispatchQueue.main.async {
-                self.payload = decoded
-                self.lastError = nil
-            }
-        } catch {
-            DispatchQueue.main.async {
-                self.lastError = "Parse error: \(error.localizedDescription)"
-            }
+    }
+
+    /// Parse a status.json timestamp (ISO8601, with or without timezone suffix).
+    static func parseStatusDate(_ iso: String) -> Date? {
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = parser.date(from: iso) { return d }
+        parser.formatOptions = [.withInternetDateTime]
+        if let d = parser.date(from: iso) { return d }
+        // generated_at has no timezone suffix; parse as local time.
+        let local = DateFormatter()
+        local.locale = Locale(identifier: "en_US_POSIX")
+        local.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
+        if let d = local.date(from: iso) { return d }
+        local.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return local.date(from: iso)
+    }
+
+    /// Warning surfaced in the menu (and status-item title) when the last
+    /// reload failed or the cached payload is older than 15 minutes.
+    var statusWarning: String? {
+        if let err = lastError { return err }
+        guard let payload,
+              let date = StatusLoader.parseStatusDate(payload.generated_at) else { return nil }
+        let age = Date().timeIntervalSince(date)
+        if age > 15 * 60 {
+            return "status.json is stale (updated \(Int(age / 60))m ago)"
         }
+        return nil
     }
 
     // ─── Bundled Python / backend paths ────────────────────────────────
@@ -220,8 +268,12 @@ class StatusLoader: ObservableObject {
     }
 
     private var devPoolPy: String {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("solo/token-status-bar/backend/pool.py").path
+        "\(poolDir)/backend/pool.py"
+    }
+
+    /// Quote a string for safe use as a single word in a POSIX shell command.
+    static func shellQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Process configured to run `pool.py <args>` with data-path env vars set.
@@ -243,24 +295,55 @@ class StatusLoader: ObservableObject {
 
     /// Shell command string for running `pool.py <args>` (for Terminal-based flows).
     func poolShellCommand(_ args: [String]) -> String {
-        let envPrefix = "AGENT_POOL_DB=\"\(dataDir)/pool.db\" AGENT_POOL_STATUS_JSON=\"\(dataDir)/status.json\""
+        let q = StatusLoader.shellQuote
+        let envPrefix = "AGENT_POOL_DB=\(q("\(dataDir)/pool.db")) AGENT_POOL_STATUS_JSON=\(q("\(dataDir)/status.json"))"
+        let quotedArgs = args.map(q).joined(separator: " ")
         if let py = bundledPython, let pool = bundledPoolPy {
-            return "\(envPrefix) \"\(py)\" \"\(pool)\" \(args.joined(separator: " "))"
+            return "\(envPrefix) \(q(py)) \(q(pool)) \(quotedArgs)"
         } else {
-            let dir = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("solo/token-status-bar/backend").path
-            return "cd \(dir) && \(envPrefix) python3 pool.py \(args.joined(separator: " "))"
+            let dir = "\(poolDir)/backend"
+            return "cd \(q(dir)) && \(envPrefix) python3 pool.py \(quotedArgs)"
         }
+    }
+
+    /// Run `pool.py <args>` synchronously, optionally writing `stdinText`
+    /// (plus a newline) to the process's stdin. Returns true on exit code 0.
+    /// Launch failures and non-zero exits are logged and surfaced via
+    /// lastError. Must not be called on the main thread.
+    @discardableResult
+    private func runPool(_ args: [String], stdinText: String? = nil) -> Bool {
+        let task = poolProcess(args)
+        var stdinPipe: Pipe?
+        if stdinText != nil {
+            let pipe = Pipe()
+            task.standardInput = pipe
+            stdinPipe = pipe
+        }
+        do {
+            try task.run()
+        } catch {
+            NSLog("pool.py \(args.first ?? "?") failed to launch: \(error.localizedDescription)")
+            DispatchQueue.main.async {
+                self.lastError = "Failed to launch backend: \(error.localizedDescription)"
+            }
+            return false
+        }
+        if let pipe = stdinPipe, let stdinText {
+            pipe.fileHandleForWriting.write(Data((stdinText + "\n").utf8))
+            pipe.fileHandleForWriting.closeFile()
+        }
+        task.waitUntilExit()
+        if task.terminationStatus != 0 {
+            NSLog("pool.py \(args.first ?? "?") exited with status \(task.terminationStatus)")
+            return false
+        }
+        return true
     }
 
     func runPoll() {
         DispatchQueue.global(qos: .userInitiated).async {
-            let task = self.poolProcess(["poll"])
-            try? task.run()
-            task.waitUntilExit()
-            DispatchQueue.main.async {
-                self.reload()
-            }
+            self.runPool(["poll"])
+            self.reload()
         }
     }
 
@@ -270,16 +353,10 @@ class StatusLoader: ObservableObject {
             if let id = accountId {
                 args += ["--account", "\(id)"]
             }
-            let task = self.poolProcess(args)
-            try? task.run()
-            task.waitUntilExit()
+            self.runPool(args)
             // heartbeat writes refresh_log only; export so the menu sees it.
-            let export = self.poolProcess(["export-status"])
-            try? export.run()
-            export.waitUntilExit()
-            DispatchQueue.main.async {
-                self.reload()
-            }
+            self.runPool(["export-status"])
+            self.reload()
         }
     }
 
@@ -287,27 +364,32 @@ class StatusLoader: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             // Regenerates history/dashboard.html fresh; the backend's --open
             // flag then opens it in the default browser.
-            let task = self.poolProcess(["dashboard", "--open"])
-            try? task.run()
-            task.waitUntilExit()
+            self.runPool(["dashboard", "--open"])
         }
     }
 
     func addAgent(provider: String) {
-        // Devin needs an interactive API key, so keep Terminal for it.
+        // Devin needs an API key: prompt in-app, then pass it via stdin so
+        // it never appears in the process argument list.
         if provider == "devin" {
-            runPoolInTerminal(["add-devin"])
+            guard let apiKey = promptDevinApiKey(confirmTitle: L10n.tr("add_new_agent")) else { return }
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.runPool(["add-devin"], stdinText: apiKey)
+                self.reload()
+            }
+            return
+        }
+        // Copilot uses the device flow: the backend prints a code the user
+        // must enter at github.com/login/device, so it needs a Terminal.
+        if provider == "copilot" {
+            runPoolInTerminal(["add", provider])
             return
         }
         // Other providers use browser OAuth — run in background, then
         // reload after the backend exports status.json.
         DispatchQueue.global(qos: .userInitiated).async {
-            let task = self.poolProcess(["add", provider])
-            try? task.run()
-            task.waitUntilExit()
-            DispatchQueue.main.async {
-                self.reload()
-            }
+            self.runPool(["add", provider])
+            self.reload()
         }
     }
 
@@ -321,40 +403,39 @@ class StatusLoader: ObservableObject {
             return
         }
         DispatchQueue.global(qos: .userInitiated).async {
-            let task = self.poolProcess(["reconnect", "\(acct.id)"])
-            try? task.run()
-            task.waitUntilExit()
-            DispatchQueue.main.async {
-                self.reload()
-            }
+            self.runPool(["reconnect", "\(acct.id)"])
+            self.reload()
         }
     }
 
-    private func reconnectDevinAgent(_ acct: Account) {
+    /// Modal secure-field prompt for a Devin API key. Returns nil on cancel/empty.
+    private func promptDevinApiKey(confirmTitle: String) -> String? {
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = L10n.tr("devin_api_key_title")
         alert.informativeText = L10n.tr("devin_api_key_message")
-        alert.addButton(withTitle: L10n.tr("reconnect_agent"))
+        alert.addButton(withTitle: confirmTitle)
         alert.addButton(withTitle: L10n.tr("cancel"))
         let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
         input.placeholderString = "API key"
         alert.accessoryView = input
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let apiKey = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !apiKey.isEmpty else { return }
+        return apiKey.isEmpty ? nil : apiKey
+    }
+
+    private func reconnectDevinAgent(_ acct: Account) {
+        guard let apiKey = promptDevinApiKey(confirmTitle: L10n.tr("reconnect_agent")) else { return }
         DispatchQueue.global(qos: .userInitiated).async {
-            let task = self.poolProcess(["reconnect", "\(acct.id)", apiKey])
-            try? task.run()
-            task.waitUntilExit()
-            DispatchQueue.main.async {
-                self.reload()
-            }
+            // Key goes over stdin, not argv, so it never shows up in `ps`.
+            self.runPool(["reconnect", "\(acct.id)"], stdinText: apiKey)
+            self.reload()
         }
     }
 
     private func runPoolInTerminal(_ args: [String]) {
         let cmd = poolShellCommand(args)
+        // Escape for embedding in an AppleScript string literal.
         let escapedCmd = cmd
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
@@ -367,17 +448,20 @@ class StatusLoader: ObservableObject {
         let task = Process()
         task.launchPath = "/usr/bin/osascript"
         task.arguments = ["-e", script]
-        try? task.run()
+        do {
+            try task.run()
+        } catch {
+            NSLog("osascript launch failed: \(error.localizedDescription)")
+            DispatchQueue.main.async {
+                self.lastError = "Failed to open Terminal: \(error.localizedDescription)"
+            }
+        }
     }
 
     func deleteAgent(accountId: Int) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let task = self.poolProcess(["remove", "\(accountId)"])
-            try? task.run()
-            task.waitUntilExit()
-            DispatchQueue.main.async {
-                self.reload()
-            }
+            self.runPool(["remove", "\(accountId)"])
+            self.reload()
         }
     }
 
@@ -1255,9 +1339,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] _ in self?.updateStatusIcon() }
             .store(in: &cancellables)
 
+        loader.$lastError
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateStatusIcon() }
+            .store(in: &cancellables)
+
         loader.start()
 
         NSApp.setActivationPolicy(.accessory)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        loader.stop()
     }
 
     private func windowRiskColor(pct: Double, severity: String?, projected: Bool) -> NSColor {
@@ -1276,10 +1369,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func headlineTitle() -> NSAttributedString? {
-        guard let h = loader.payload?.headline else { return nil }
+        let warn = loader.statusWarning != nil
+        guard let h = loader.payload?.headline else {
+            guard warn else { return nil }
+            return NSAttributedString(string: " ⚠︎", attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: NSColor.systemOrange,
+                .baselineOffset: 0.5,
+            ])
+        }
         var text = " \(Int(h.used_pct.rounded()))%"
         if let left = AppDelegate.timeLeft(h.reset_at_epoch) { text += " · \(left)" }
-        let color = windowRiskColor(pct: h.used_pct, severity: h.severity, projected: false)
+        if warn { text += " ⚠︎" }
+        let color = warn ? NSColor.systemOrange
+            : windowRiskColor(pct: h.used_pct, severity: h.severity, projected: false)
         return NSAttributedString(string: text, attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
             .foregroundColor: color,
@@ -1365,6 +1468,10 @@ extension AppDelegate: NSMenuDelegate {
         }
 
         // Header
+        if let warning = loader.statusWarning {
+            menu.addItem(warningItem("⚠︎ \(warning)"))
+            menu.addItem(separatorRow())
+        }
         menu.addItem(titleItem("Agent Pool: \(payload.account_count) accounts"))
         menu.addItem(infoItem("\(t("updated")): \(formatUpdated(payload.generated_at))"))
         if let heartbeat = payload.heartbeat {
@@ -2056,8 +2163,13 @@ extension AppDelegate: NSMenuDelegate {
     }
 
     func timezoneLabel() -> String {
-        let offset = TimeZone.current.secondsFromGMT() / 3600
-        let offsetStr = offset >= 0 ? "UTC+\(offset)" : "UTC\(offset)"
+        let seconds = TimeZone.current.secondsFromGMT()
+        let sign = seconds < 0 ? "-" : "+"
+        let hours = abs(seconds) / 3600
+        let minutes = (abs(seconds) % 3600) / 60
+        let offsetStr = minutes == 0
+            ? "UTC\(sign)\(hours)"
+            : String(format: "UTC%@%d:%02d", sign, hours, minutes)
         return "Time Zone: \(offsetStr)"
     }
 

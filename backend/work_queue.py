@@ -21,3 +21,16 @@ def single_worker(name: str):
             yield True
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+
+
+@contextmanager
+def exclusive(name: str):
+    """Block until this process owns the named worker lock, then yield."""
+    store.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    path = store.DB_PATH.parent / f"{name}.lock"
+    with open(path, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)

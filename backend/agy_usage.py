@@ -25,7 +25,8 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?$ ]*[A-Za-z]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\
 _GROUP_RE = re.compile(r"^\s*([A-Z][A-Z &/]* MODELS)\s*$")
 _WINDOW_RE = re.compile(r"^\s*(Weekly|Five Hour) Limit\s*$")
 _BAR_PCT_RE = re.compile(r"\]\s*([0-9]+(?:\.[0-9]+)?)%")
-_REFRESH_RE = re.compile(r"Refreshes in\s+(?:(\d+)h)?\s*(?:(\d+)m)?")
+_REFRESH_RE = re.compile(
+    r"Refreshes in\s+<?\s*(?:(\d+)d)?\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?")
 
 
 def parse_usage_panel(text: str, now: float | None = None):
@@ -67,8 +68,9 @@ def parse_usage_panel(text: str, now: float | None = None):
             window = None
             continue
         m = _REFRESH_RE.search(line)
-        if m and (m.group(1) or m.group(2)):
-            secs = int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60
+        if m and any(m.groups()):
+            d, h, mi, s = (int(g or 0) for g in m.groups())
+            secs = d * 86400 + h * 3600 + mi * 60 + s
             windows.append({"group": group, "window": window,
                             "remaining_pct": bar_pct if bar_pct is not None else 100.0,
                             "reset_at": now + secs})

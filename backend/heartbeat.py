@@ -156,7 +156,9 @@ def _heartbeat_claude(account, token) -> str:
 # ─── antigravity / agy ─────────────────────────────────────────────────────
 def _heartbeat_antigravity(account, token) -> str:
     # `agy` uses the currently logged-in Google session. With a single account
-    # in the pool this matches. Multi-account would need isolated state dirs.
+    # in the pool this matches; run_once() skips antigravity entirely when the
+    # pool holds more than one account. Multi-account would need isolated
+    # state dirs.
     agy = _which("agy")
     if not agy:
         raise RuntimeError("agy CLI not found on PATH")
@@ -194,8 +196,11 @@ def run_once(conn, account_id: int | None = None) -> int:
             print("heartbeat already running; skipped")
             return 0
 
+        all_accounts = store.list_accounts(conn)
+        agy_count = sum(1 for a in all_accounts
+                        if a["provider"] == "antigravity" and not a.get("disabled"))
         accounts = [
-            a for a in store.list_accounts(conn)
+            a for a in all_accounts
             if a["provider"] in PROVIDERS and not a.get("disabled")
             and (account_id is None or a["id"] == account_id)
         ]
@@ -211,6 +216,15 @@ def run_once(conn, account_id: int | None = None) -> int:
         ok = fail = 0
         for a in accounts:
             label = f"{a['provider']:12} {a['email'] or a['label']}"
+            if a["provider"] == "antigravity" and agy_count > 1:
+                # `agy` always uses the globally logged-in Google session, so
+                # with several pool accounts the heartbeat could burn quota on
+                # the wrong one. Skip until per-account isolation exists.
+                msg = (f"skipped: {agy_count} antigravity accounts in pool; "
+                       "agy CLI uses the global login (wrong-account burn risk)")
+                store.log_event(conn, a["id"], "heartbeat", False, msg)
+                print(f"  ⚠ {label}: {msg}")
+                continue
             token = store.get_token(conn, a["id"])
             if not token or not token.get("access_token"):
                 store.log_event(conn, a["id"], "heartbeat", False, "no token")

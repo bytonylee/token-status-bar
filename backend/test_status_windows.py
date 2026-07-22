@@ -139,11 +139,25 @@ class HeadlineTest(unittest.TestCase):
         ]
         self.assertEqual(status.select_headline(items)["account_id"], 2)
 
-    def test_past_reset_skipped(self):
+    def test_past_reset_shows_effective_zero(self):
+        # A window whose reset passed has reset to 0% — the headline shows the
+        # effective value (refresh_windows post-pass), not the stale used_pct.
         now = time.time()
         items = [self._item(1, [{"kind": "5h", "label": None, "used_pct": 99.0,
                                  "reset_at_epoch": now - 10, "severity": "normal"}])]
-        self.assertIsNone(status.select_headline(items))
+        h = status.select_headline(items)
+        self.assertEqual(h["used_pct"], 0.0)
+        self.assertGreater(h["reset_at_epoch"], now)  # rolled forward one 5h step
+
+    def test_live_window_beats_reset_window(self):
+        now = time.time()
+        items = [
+            self._item(1, [{"kind": "5h", "label": None, "used_pct": 99.0,
+                            "reset_at_epoch": now - 10, "severity": "exceeded"}]),
+            self._item(2, [{"kind": "weekly", "label": None, "used_pct": 40.0,
+                            "reset_at_epoch": now + 100, "severity": "normal"}]),
+        ]
+        self.assertEqual(status.select_headline(items)["account_id"], 2)
 
     def test_empty(self):
         self.assertIsNone(status.select_headline([]))

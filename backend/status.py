@@ -9,6 +9,9 @@ STATUS_JSON = Path(os.environ.get("AGENT_POOL_STATUS_JSON",
 KST = zoneinfo.ZoneInfo("Asia/Seoul")
 HEARTBEAT_INTERVAL_S = 5 * 60 * 60
 HEARTBEAT_PROVIDERS = ("codex", "claude", "antigravity")
+# Mirrors poller.POLL_INTERVAL (poller imports status, so no import here).
+POLL_INTERVAL_S = int(os.environ.get("AGENT_POOL_POLL_INTERVAL", "300"))
+STALE_AFTER_S = 3 * POLL_INTERVAL_S
 
 
 def ts_fmt(ts) -> str:
@@ -507,25 +510,71 @@ def normalize_windows(provider, snap) -> list[dict]:
     return out
 
 
+# Cadences for the roll-forward in refresh_windows(). Normalized windows
+# carry "kind" rather than window_s, so cadence is derived from kind; monthly
+# and unlabelled kinds have variable length and cannot be rolled.
+WINDOW_CADENCE_S = {"5h": 5 * 3600, "daily": 86400, "weekly": 604800,
+                    "model_weekly": 604800}
+
+
+def refresh_windows(windows, now=None):
+    """Post-pass over normalize_windows() output (deterministic, idempotent).
+
+    Sets on every window:
+      phase               "live", or "reset" once reset_at_epoch has passed
+      used_pct_effective  used_pct while live, 0.0 once the window has reset
+      stale               True when the snapshot as_of is older than 3× the
+                          poll interval, or a reset window's cadence is
+                          unknown (its reset_at_epoch could not be rolled)
+
+    Reset windows with a known cadence get reset_at_epoch rolled forward by
+    whole cadence multiples until it is strictly after now. All consumers
+    (headline, gauges, account_state, swap) read used_pct_effective — this is
+    the single clamp point for past-reset data.
+    """
+    now = now if now is not None else time.time()
+    for w in windows or []:
+        as_of = w.get("as_of_epoch")
+        stale = as_of is not None and (now - as_of) > STALE_AFTER_S
+        reset = w.get("reset_at_epoch")
+        if "phase" not in w:
+            if reset is not None and reset < now:
+                w["phase"] = "reset"
+                w["used_pct_effective"] = 0.0
+                cadence = WINDOW_CADENCE_S.get(w.get("kind"))
+                if cadence:
+                    steps = int((now - reset) // cadence) + 1
+                    w["reset_at_epoch"] = reset + steps * cadence
+                else:
+                    stale = True  # can't tell where the new window starts
+            else:
+                w["phase"] = "live"
+                w["used_pct_effective"] = w.get("used_pct")
+        elif w["phase"] == "reset" and reset is not None and reset < now:
+            stale = True  # unknown-cadence reset kept its stale reset_at
+        w["stale"] = bool(stale)
+    return windows
+
+
 def select_headline(items) -> dict | None:
     """The single riskiest window across all accounts, for the menu bar title."""
     now_ts = time.time()
     best, best_key = None, None
     for it in items:
-        for w in it.get("windows") or []:
-            if w.get("used_pct") is None:
+        for w in refresh_windows(it.get("windows") or [], now_ts):
+            used = w.get("used_pct_effective")
+            if used is None:
                 continue
-            reset = w.get("reset_at_epoch")
-            if reset and reset < now_ts:
-                continue
-            sev = 0 if (w.get("severity") or "normal") == "normal" else 1
+            is_reset = w.get("phase") == "reset"
+            sev = 0 if is_reset or (w.get("severity") or "normal") == "normal" else 1
             proj = 1 if w.get("projected_exhaust_epoch") else 0
-            key = (sev, proj, w["used_pct"], -(reset or 1e18))
+            reset = w.get("reset_at_epoch")
+            key = (sev, proj, used, -(reset or 1e18))
             if best_key is None or key > best_key:
                 best_key = key
                 best = {"account_id": it["id"], "provider": it["provider"],
                         "email": it.get("email"), "kind": w["kind"],
-                        "label": w.get("label"), "used_pct": w["used_pct"],
+                        "label": w.get("label"), "used_pct": used,
                         "reset_at_epoch": reset, "severity": w.get("severity") or "normal"}
     return best
 
@@ -663,6 +712,124 @@ def plan_label(provider, plan, item) -> tuple:
     return (p or None, None)
 
 
+# ─── account lifecycle state ────────────────────────────────────────────────
+SUB_RENEWS_SOON_S = 72 * 3600
+
+
+def _parse_when(val) -> datetime.datetime | None:
+    """Aware datetime from an epoch, an ISO string, or the KST-rendered
+    'YYYY-MM-DD HH:MM' format that export fields like renews_at carry."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return datetime.datetime.fromtimestamp(float(val), tz=datetime.timezone.utc)
+    s = str(val).strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", s):
+        return datetime.datetime.strptime(s, "%Y-%m-%d %H:%M").replace(tzinfo=KST)
+    return _parse_iso(s)
+
+
+def _window_risk_key(w) -> tuple:
+    """Ranking key for the riskiest window — mirrors select_headline."""
+    sev = 0 if w.get("phase") == "reset" or (w.get("severity") or "normal") == "normal" else 1
+    used = w.get("used_pct_effective")
+    if used is None:
+        used = w.get("used_pct") or 0.0
+    return (sev, used, -(w.get("reset_at_epoch") or 1e18))
+
+
+def account_state(item, now=None) -> dict:
+    """Exact per-account lifecycle classification, recomputed at every export.
+
+    Pure with respect to its inputs (spec §1.2); item["windows"] is passed
+    through refresh_windows() first (idempotent, no-op when cmd_export has
+    already refreshed them).
+
+    Returns {
+      "auth":  "ok" | "token_expired" | "error",
+      "subscription": "paid" | "free" | "expired" | "renews_soon" | "unknown",
+      "sub_renews_at": iso | None,     # next billing anniversary
+      "sub_expires_at": iso | None,    # hard end if cancelled
+      "quota": "ok" | "warning" | "exhausted" | "unknown",
+      "usable": bool,                  # auth ok AND sub not expired
+                                       # AND quota != exhausted
+      "binding_window": {...} | None,  # riskiest non-expired fresh window
+    }
+    """
+    now = now if now is not None else time.time()
+    now_dt = datetime.datetime.fromtimestamp(now, tz=datetime.timezone.utc)
+
+    if item.get("token_expired"):
+        auth = "token_expired"
+    elif item.get("status") == "error":
+        auth = "error"
+    else:
+        auth = "ok"
+
+    provider = item.get("provider")
+    subscription, renews_dt, expires_dt = "unknown", None, None
+    if provider == "codex":
+        renews_dt = _parse_when(item.get("renews_at"))
+        expires_dt = _parse_when(item.get("expires_at"))
+        if item.get("has_active_subscription"):
+            subscription = "free" if item.get("is_active_subscription_gratis") else "paid"
+            if subscription == "paid" and renews_dt is not None and \
+                    0 <= (renews_dt - now_dt).total_seconds() <= SUB_RENEWS_SOON_S:
+                subscription = "renews_soon"
+        elif expires_dt is not None and expires_dt < now_dt:
+            subscription = "expired"
+    elif provider == "claude":
+        s = (item.get("subscription_status") or "").lower()
+        if s == "active":
+            subscription = "paid"
+        elif s in ("expired", "cancelled", "canceled", "past_due"):
+            subscription = "expired"
+        elif s == "free":
+            subscription = "free"
+        renews_dt = _parse_when(item.get("plan_reset"))
+    elif provider == "copilot":
+        sku = (item.get("sku") or item.get("access_sku") or "").lower()
+        if sku:
+            subscription = "free" if "free" in sku else "paid"
+        renews_dt = _parse_when(item.get("plan_reset"))
+    elif provider in ("xai", "devin", "antigravity"):
+        plan = (item.get("plan") or "").strip()
+        if plan:
+            subscription = "free" if plan.lower().startswith("free") else "paid"
+        renews_dt = _parse_when(item.get("plan_reset"))
+
+    windows = refresh_windows(item.get("windows") or [], now)
+    fresh = [w for w in windows if not w.get("stale")]
+    live = [w for w in fresh if w.get("phase") != "reset"]
+    binding = max(fresh, key=_window_risk_key, default=None)
+
+    def _exhausted(w) -> bool:
+        used = w.get("used_pct_effective")
+        sev = (w.get("severity") or "normal").lower()
+        return (used is not None and used >= 100.0) or sev in ("rate_limited", "exceeded")
+
+    if item.get("status") == "rate_limited":
+        quota = "exhausted"
+    elif not fresh:
+        quota = "unknown"  # no fresh windows and no rate-limit signal
+    elif live and all(_exhausted(w) for w in live):
+        quota = "exhausted"
+    elif binding is not None and (binding.get("used_pct_effective") or 0.0) >= 80.0:
+        quota = "warning"
+    else:
+        quota = "ok"
+
+    return {
+        "auth": auth,
+        "subscription": subscription,
+        "sub_renews_at": renews_dt.isoformat() if renews_dt else None,
+        "sub_expires_at": expires_dt.isoformat() if expires_dt else None,
+        "quota": quota,
+        "usable": auth == "ok" and subscription != "expired" and quota != "exhausted",
+        "binding_window": dict(binding) if binding else None,
+    }
+
+
 def cmd_export(conn) -> int:
     """Write status.json for the menu bar app to read."""
     accounts = store.list_accounts(conn)
@@ -721,6 +888,8 @@ def cmd_export(conn) -> int:
         items[-1]["plan_price"] = price
         items[-1]["windows"] = normalize_windows(a["provider"], snap)
         attach_projections(conn, a, items[-1]["windows"])
+        refresh_windows(items[-1]["windows"])
+        items[-1]["state"] = account_state(items[-1])
         live = store.get_live_activity(conn, a["id"])
         if live and (time.time() - float(live.get("ts", 0))) < 600:
             live["as_of_epoch"] = float(live.pop("ts"))

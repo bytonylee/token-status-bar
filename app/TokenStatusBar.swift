@@ -9,6 +9,19 @@ struct StatusPayload: Codable {
     var heartbeat: HeartbeatSummary?
     var headline: Headline?
     var accounts: [Account]
+    // Last auto-swap event (M4 swap engine; absent until then).
+    var last_swap: LastSwap?
+}
+
+/// Placeholder for the M4 swap engine's "account_swapped" export.
+/// All fields optional so the row simply renders nothing until the
+/// backend starts emitting `last_swap`.
+struct LastSwap: Codable {
+    var provider: String?
+    var from: String?
+    var to: String?
+    var at: String?
+    var at_epoch: Double?
 }
 
 struct HeartbeatSummary: Codable {
@@ -103,6 +116,22 @@ struct Account: Codable, Identifiable {
     var usage_windows: [UsageWindow]?
     var windows: [WindowInfo]?
     var live: LiveActivity?
+    // Per-poll lifecycle classification (backend account_state, spec §1.2).
+    // Optional so older status.json files still decode.
+    var state: AccountState?
+}
+
+/// Exact per-account lifecycle state exported by the backend on every poll.
+/// Every field is optional-tolerant: decoding must not break on payloads
+/// written before this field existed.
+struct AccountState: Codable {
+    var auth: String?           // "ok" | "token_expired" | "error"
+    var subscription: String?   // "paid" | "free" | "expired" | "renews_soon" | "unknown"
+    var sub_renews_at: String?
+    var sub_expires_at: String?
+    var quota: String?          // "ok" | "warning" | "exhausted" | "unknown"
+    var usable: Bool?
+    var binding_window: WindowInfo?
 }
 
 struct ResetCredit: Codable {
@@ -130,6 +159,11 @@ struct WindowInfo: Codable {
     var source: String?
     var as_of_epoch: Double?
     var projected_exhaust_epoch: Double?
+    // Window phase fields (backend refresh_windows, spec §1.3). Optional so
+    // older status.json files still decode.
+    var phase: String?              // "live" | "reset"
+    var used_pct_effective: Double?
+    var stale: Bool?
 }
 
 struct Headline: Codable {
@@ -522,13 +556,14 @@ final class FixedMenuRowView: NSView {
     private let action: (() -> Void)?
     private let submenu: NSMenu?
     private let dotColor: NSColor?
+    private let hollowDot: Bool
     private let accentNumbers: Bool
     private let accentPercent: Bool
     private let warnPercent: Bool
     private let accentResetTime: Bool
     private let checkmark: Bool
     private let destructive: Bool
-    private let rawTitle: String
+    private var rawTitle: String
     private let badgeText: String?
     private let label = NSTextField(labelWithString: "")
     private let chevron = NSTextField(labelWithString: "›")
@@ -539,7 +574,8 @@ final class FixedMenuRowView: NSView {
     private var hovered = false
 
     init(title: String, style: Style, action: (() -> Void)? = nil, submenu: NSMenu? = nil,
-         dotColor: NSColor? = nil, accentNumbers: Bool = false, accentPercent: Bool = false,
+         dotColor: NSColor? = nil, hollowDot: Bool = false,
+         accentNumbers: Bool = false, accentPercent: Bool = false,
          warnPercent: Bool = false, accentResetTime: Bool = false,
          checkmark: Bool = false, badge: String? = nil, destructive: Bool = false,
          width: CGFloat = MenuRowLayout.width) {
@@ -547,6 +583,7 @@ final class FixedMenuRowView: NSView {
         self.action = action
         self.submenu = submenu
         self.dotColor = dotColor
+        self.hollowDot = hollowDot
         self.accentNumbers = accentNumbers
         self.accentPercent = accentPercent
         self.warnPercent = warnPercent
@@ -564,7 +601,14 @@ final class FixedMenuRowView: NSView {
 
         if let dotColor {
             dotLayer.cornerRadius = 4
-            dotLayer.backgroundColor = dotColor.cgColor
+            if hollowDot {
+                // Hollow dot: outline only (blocked accounts).
+                dotLayer.backgroundColor = NSColor.clear.cgColor
+                dotLayer.borderColor = dotColor.cgColor
+                dotLayer.borderWidth = 1.5
+            } else {
+                dotLayer.backgroundColor = dotColor.cgColor
+            }
             layer?.addSublayer(dotLayer)
         }
 
@@ -608,6 +652,14 @@ final class FixedMenuRowView: NSView {
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    /// Replace the row text in place (used by the 1s menu ticker so reset
+    /// countdowns keep ticking while the menu stays open).
+    func updateTitle(_ title: String) {
+        guard title != rawTitle else { return }
+        rawTitle = title
+        applyTitle(highlighted: hovered && (style == .action || style == .submenu))
     }
 
     private func applyTitle(highlighted: Bool) {
@@ -788,7 +840,11 @@ final class GaugeRowView: NSView {
 
 /// Account row + its gauge bars stacked into one menu-item view.
 final class AccountRowWithGauges: NSView {
+    /// The title row, exposed so the 1s menu ticker can update countdowns.
+    let rowView: FixedMenuRowView
+
     init(row: FixedMenuRowView, gauges: [GaugeRowView], width: CGFloat) {
+        self.rowView = row
         let gaugeH: CGFloat = 16
         let pad: CGFloat = gauges.isEmpty ? 0 : 4
         let height = MenuRowLayout.standardHeight + CGFloat(gauges.count) * gaugeH + pad
@@ -945,6 +1001,29 @@ enum L10n {
             "warn_weekly_closing": "resets in %dh — weekly limit closing",
             "weekly_short": "weekly",
             "finishes_soon": "End Soon",
+            // ── Layout experiment (usable-first, spec §2) ──
+            "layout": "Layout",
+            "layout_classic": "Classic",
+            "layout_usable_first": "Usable-first",
+            "use_now_header": "USE NOW",
+            "limited_header": "LIMITED / COOLING DOWN",
+            "blocked_header": "BLOCKED",
+            "other_header": "OTHER",
+            "usable_count": "usable",
+            "pct_left": "left",
+            "resets_in": "resets in %@",
+            "usable_now": "reset · usable now",
+            "quota_exhausted": "quota exhausted",
+            "token_expired_reconnect": "token expired · reconnect",
+            "error_prefix": "error",
+            "sub_expired_on": "sub expired %@",
+            // ── Subscription line (account submenus) ──
+            "sub_paid": "paid",
+            "sub_free": "free",
+            "sub_renews": "renews %@",
+            "sub_renews_soon": "renews soon %@",
+            "sub_expired_since": "expired since %@",
+            "sub_expired": "expired",
         ],
         .ko: [
             // ── Footer ──
@@ -1057,6 +1136,29 @@ enum L10n {
             "warn_weekly_closing": "%d시간 후 리셋 — 주간 제한 마감",
             "weekly_short": "주간",
             "finishes_soon": "곧 종료",
+            // ── Layout experiment (usable-first, spec §2) ──
+            "layout": "레이아웃",
+            "layout_classic": "클래식",
+            "layout_usable_first": "사용 가능 우선",
+            "use_now_header": "지금 사용",
+            "limited_header": "제한 / 쿨다운",
+            "blocked_header": "차단됨",
+            "other_header": "기타",
+            "usable_count": "사용 가능",
+            "pct_left": "남음",
+            "resets_in": "%@ 후 리셋",
+            "usable_now": "리셋됨 · 사용 가능",
+            "quota_exhausted": "할당량 소진",
+            "token_expired_reconnect": "토큰 만료 · 다시 연결",
+            "error_prefix": "오류",
+            "sub_expired_on": "구독 만료 %@",
+            // ── Subscription line (account submenus) ──
+            "sub_paid": "결제 중",
+            "sub_free": "무료",
+            "sub_renews": "%@ 갱신",
+            "sub_renews_soon": "곧 갱신 (%@)",
+            "sub_expired_since": "%@부터 만료",
+            "sub_expired": "만료됨",
         ],
         .zh: [
             // ── Footer ──
@@ -1169,6 +1271,29 @@ enum L10n {
             "warn_weekly_closing": "%d小时后重置 — 每周限制即将关闭",
             "weekly_short": "每周",
             "finishes_soon": "即将结束",
+            // ── Layout experiment (usable-first, spec §2) ──
+            "layout": "布局",
+            "layout_classic": "经典",
+            "layout_usable_first": "可用优先",
+            "use_now_header": "立即可用",
+            "limited_header": "受限 / 冷却中",
+            "blocked_header": "已阻断",
+            "other_header": "其他",
+            "usable_count": "可用",
+            "pct_left": "剩余",
+            "resets_in": "%@ 后重置",
+            "usable_now": "已重置 · 可用",
+            "quota_exhausted": "配额耗尽",
+            "token_expired_reconnect": "令牌过期 · 重新连接",
+            "error_prefix": "错误",
+            "sub_expired_on": "订阅过期 %@",
+            // ── Subscription line (account submenus) ──
+            "sub_paid": "已付费",
+            "sub_free": "免费",
+            "sub_renews": "%@ 续订",
+            "sub_renews_soon": "即将续订 %@",
+            "sub_expired_since": "自 %@ 过期",
+            "sub_expired": "已过期",
         ],
         .ja: [
             // ── Footer ──
@@ -1281,6 +1406,29 @@ enum L10n {
             "warn_weekly_closing": "%d時間後にリセット — 週間制限終了間近",
             "weekly_short": "週間",
             "finishes_soon": "まもなく終了",
+            // ── Layout experiment (usable-first, spec §2) ──
+            "layout": "レイアウト",
+            "layout_classic": "クラシック",
+            "layout_usable_first": "使用可能優先",
+            "use_now_header": "今すぐ使用",
+            "limited_header": "制限 / クールダウン中",
+            "blocked_header": "ブロック",
+            "other_header": "その他",
+            "usable_count": "使用可能",
+            "pct_left": "残り",
+            "resets_in": "%@ 後にリセット",
+            "usable_now": "リセット済み · 使用可能",
+            "quota_exhausted": "クォータ枯渇",
+            "token_expired_reconnect": "トークン期限切れ · 再接続",
+            "error_prefix": "エラー",
+            "sub_expired_on": "サブスク期限切れ %@",
+            // ── Subscription line (account submenus) ──
+            "sub_paid": "有料",
+            "sub_free": "無料",
+            "sub_renews": "%@ 更新",
+            "sub_renews_soon": "まもなく更新 %@",
+            "sub_expired_since": "%@ から期限切れ",
+            "sub_expired": "期限切れ",
         ],
     ]
 
@@ -1305,6 +1453,28 @@ enum L10n {
     static func bool(_ key: String) -> String { tr(key) }
 }
 
+// ─── Dropdown layout experiment (spec §2.1) ────────────────────────────────
+enum MenuLayout: String, CaseIterable {
+    case classic
+    case usableFirst = "usable-first"
+
+    var titleKey: String {
+        switch self {
+        case .classic: return "layout_classic"
+        case .usableFirst: return "layout_usable_first"
+        }
+    }
+
+    static let storageKey = "menuLayout"
+    static var current: MenuLayout {
+        get {
+            let raw = UserDefaults.standard.string(forKey: storageKey) ?? MenuLayout.classic.rawValue
+            return MenuLayout(rawValue: raw) ?? .classic
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: storageKey) }
+    }
+}
+
 // ─── Menu Bar App ─────────────────────────────────────────────────────────
 @main
 struct TokenStatusBarApp: App {
@@ -1322,11 +1492,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var loader = StatusLoader()
     var popover: NSPopover!
     var language: Language = .en
+    var menuLayout: MenuLayout = .classic
+    // 1s ticker: keeps LIMITED-section reset countdowns ticking while the
+    // menu is open (usable-first layout only). Section moves happen on the
+    // next menu open (menuNeedsUpdate re-derives phase client-side).
+    private var menuTicker: Timer?
+    private var limitedRows: [(row: FixedMenuRowView, account: Account)] = []
     private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         language = Language.current
         L10n.lang = language
+        menuLayout = MenuLayout.current
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateStatusIcon()
 
@@ -1350,6 +1527,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        stopMenuTicker()
         loader.stop()
     }
 
@@ -1455,7 +1633,18 @@ extension AppDelegate: NSMenuDelegate {
         buildMenu(menu)
     }
 
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === statusItem.menu, menuLayout == .usableFirst else { return }
+        startMenuTicker()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        guard menu === statusItem.menu else { return }
+        stopMenuTicker()
+    }
+
     func buildMenu(_ menu: NSMenu) {
+        limitedRows = []
         guard let payload = loader.payload else {
             menu.addItem(headerItem(t("loading")))
             if let err = loader.lastError {
@@ -1464,6 +1653,13 @@ extension AppDelegate: NSMenuDelegate {
             }
             menu.addItem(separatorRow())
             addFooter(menu)
+            return
+        }
+
+        // Layout experiment (spec §2.1): usable-first restructures the list
+        // around "what can I use right now"; classic stays untouched below.
+        if menuLayout == .usableFirst {
+            buildUsableFirstMenu(menu, payload: payload)
             return
         }
 
@@ -1491,7 +1687,14 @@ extension AppDelegate: NSMenuDelegate {
             menu.addItem(separatorRow())
         }
 
-        // Live ticker: freshest local session activity across accounts.
+        addLiveActivityRow(menu, payload: payload)
+
+        addFooter(menu)
+    }
+
+    /// Live ticker row: freshest local session activity across accounts.
+    /// Shared by both layouts (unchanged from classic).
+    private func addLiveActivityRow(_ menu: NSMenu, payload: StatusPayload) {
         let fresh = payload.accounts.compactMap { a -> (Account, LiveActivity, Double)? in
             guard let live = a.live, let ts = live.as_of_epoch ?? live.event_epoch,
                   Date().timeIntervalSince1970 - ts < 600 else { return nil }
@@ -1511,8 +1714,254 @@ extension AppDelegate: NSMenuDelegate {
             menu.addItem(infoItem("⚡︎ " + parts.joined(separator: " · ")))
             menu.addItem(separatorRow())
         }
+    }
 
+    // ─── usable-first layout (spec §2.2) ─────────────────────────────────
+
+    enum AccountSection {
+        case useNow, limited, blocked, other
+    }
+
+    /// Effective per-window used% with the client-side phase rule applied:
+    /// a window whose reset_at_epoch has already passed counts as reset
+    /// (0% used) without waiting for the next poll (spec §1.3 / §2.2).
+    func windowEffectivePct(_ w: WindowInfo, now: Double) -> Double? {
+        if w.phase == "reset" { return 0 }
+        if let reset = w.reset_at_epoch, reset < now { return 0 }
+        return w.used_pct_effective ?? w.used_pct
+    }
+
+    /// Client-side section assignment from the exported `state`, re-deriving
+    /// window phase at `now` so a countdown hitting 0 moves the account to
+    /// USE NOW on the next rebuild without waiting for the next poll.
+    func effectiveSection(_ acct: Account, now: Double) -> AccountSection {
+        guard let state = acct.state else { return .other }
+        if (state.auth ?? "ok") != "ok" || state.subscription == "expired" {
+            return .blocked
+        }
+        var quota = state.quota ?? "unknown"
+        if quota == "exhausted" {
+            // Phase flip: exhaustion requires every live window at 100%, so
+            // once any live window's reset time passes the account recovers.
+            let live = (acct.windows ?? []).filter { $0.stale != true && $0.phase != "reset" }
+            if live.contains(where: { ($0.reset_at_epoch ?? .infinity) < now }) {
+                quota = "ok"
+            }
+        }
+        switch quota {
+        case "exhausted": return .limited
+        case "unknown": return .other
+        default: return .useNow // ok and warning are both usable
+        }
+    }
+
+    private func windowKindLabel(_ w: WindowInfo) -> String {
+        if w.kind == "model_weekly" { return w.label ?? "model" }
+        if w.kind == "monthly", let label = w.label { return label }
+        return w.kind
+    }
+
+    /// "weekly 78% left" from the account's binding window.
+    private func bindingSummary(_ acct: Account, now: Double) -> String? {
+        guard let w = acct.state?.binding_window,
+              let pct = windowEffectivePct(w, now: now) else { return nil }
+        let left = max(0, 100 - Int(pct.rounded()))
+        return "\(windowKindLabel(w)) \(left)% \(t("pct_left"))"
+    }
+
+    /// "5h 0% left · resets in 42m" — why the account is cooling down.
+    private func limitedReason(_ acct: Account, now: Double) -> String {
+        let windows = (acct.windows ?? []).filter { $0.stale != true }
+        let exhausted = windows.filter { w in
+            let sev = (w.severity ?? "normal").lowercased()
+            return (windowEffectivePct(w, now: now) ?? 0) >= 100
+                || sev == "rate_limited" || sev == "exceeded"
+        }
+        let nextReset = exhausted.compactMap { $0.reset_at_epoch }.filter { $0 > now }.min()
+        guard let nextReset else { return t("quota_exhausted") }
+        let kind = exhausted.first(where: { $0.reset_at_epoch == nextReset }).map(windowKindLabel)
+        var text = kind.map { "\($0) 0% \(t("pct_left"))" } ?? t("quota_exhausted")
+        if let left = AppDelegate.timeLeft(nextReset) {
+            text += " · " + String(format: t("resets_in"), left)
+        }
+        return text
+    }
+
+    /// Full row title for a LIMITED account; recomputed by the 1s ticker so
+    /// the countdown ticks while the menu is open. When the countdown hits 0
+    /// (phase flips client-side) it says so in place; the row moves to
+    /// USE NOW on the next rebuild.
+    private func limitedRowTitle(_ acct: Account, now: Double) -> String {
+        let base = "\(providerDisplayName(acct.provider)) · \(accountTitle(acct))"
+        if effectiveSection(acct, now: now) != .limited {
+            return "\(base) · \(t("usable_now"))"
+        }
+        return "\(base) · \(limitedReason(acct, now: now))"
+    }
+
+    /// Exact reason a BLOCKED account can't be used.
+    private func blockedReason(_ acct: Account) -> String {
+        guard let state = acct.state else { return t("no_details") }
+        switch state.auth ?? "ok" {
+        case "token_expired":
+            return t("token_expired_reconnect")
+        case "error":
+            let msg = acct.status_message ?? ""
+            return msg.isEmpty ? t("error_prefix") : "\(t("error_prefix")): \(msg)"
+        default:
+            break
+        }
+        if state.subscription == "expired" {
+            return String(format: t("sub_expired_on"), shortMonthDay(state.sub_expires_at) ?? "?")
+        }
+        return t("no_details")
+    }
+
+    func buildUsableFirstMenu(_ menu: NSMenu, payload: StatusPayload) {
+        let now = Date().timeIntervalSince1970
+
+        if let warning = loader.statusWarning {
+            menu.addItem(warningItem("⚠︎ \(warning)"))
+            menu.addItem(separatorRow())
+        }
+
+        var useNow: [Account] = []
+        var limited: [Account] = []
+        var blocked: [Account] = []
+        var other: [Account] = []
+        for acct in payload.accounts {
+            switch effectiveSection(acct, now: now) {
+            case .useNow: useNow.append(acct)
+            case .limited: limited.append(acct)
+            case .blocked: blocked.append(acct)
+            case .other: other.append(acct)
+            }
+        }
+
+        // Header
+        menu.addItem(titleItem(
+            "Agent Pool: \(payload.account_count) accounts · \(useNow.count) \(t("usable_count"))"))
+        menu.addItem(infoItem("\(t("updated")): \(formatUpdated(payload.generated_at))"))
+        if let heartbeat = payload.heartbeat {
+            menu.addItem(heartbeatItem(heartbeat, accounts: payload.accounts))
+        }
+        menu.addItem(separatorRow())
+
+        // USE NOW: best-headroom account first within each provider.
+        let providerOrder = ["codex", "claude", "xai", "antigravity", "copilot", "cursor", "devin", "droid", "opencode"]
+        func providerRank(_ p: String) -> Int { providerOrder.firstIndex(of: p) ?? providerOrder.count }
+        func headroom(_ a: Account) -> Double {
+            guard let w = a.state?.binding_window,
+                  let pct = windowEffectivePct(w, now: now) else { return 100 }
+            return 100 - pct
+        }
+        useNow.sort { a, b in
+            if providerRank(a.provider) != providerRank(b.provider) {
+                return providerRank(a.provider) < providerRank(b.provider)
+            }
+            return headroom(a) > headroom(b)
+        }
+
+        if !useNow.isEmpty {
+            menu.addItem(headerItem(t("use_now_header")))
+            for acct in useNow {
+                var title = "\(providerDisplayName(acct.provider)) · \(accountTitle(acct))"
+                if let summary = bindingSummary(acct, now: now) { title += " · \(summary)" }
+                menu.addItem(accountItem(acct, titleOverride: title, dotColorOverride: .systemGreen))
+            }
+            menu.addItem(separatorRow())
+        }
+
+        // LIMITED / COOLING DOWN: strictly quota-exhausted (auth ok, sub fine).
+        if !limited.isEmpty {
+            menu.addItem(headerItem(t("limited_header")))
+            for acct in limited {
+                let item = accountItem(acct, titleOverride: limitedRowTitle(acct, now: now),
+                                       dotColorOverride: .systemYellow)
+                if let container = item.view as? AccountRowWithGauges {
+                    limitedRows.append((row: container.rowView, account: acct))
+                }
+                menu.addItem(item)
+            }
+            menu.addItem(separatorRow())
+        }
+
+        // BLOCKED: auth or subscription problem.
+        if !blocked.isEmpty {
+            menu.addItem(headerItem(t("blocked_header")))
+            for acct in blocked {
+                let title = "\(providerDisplayName(acct.provider)) · \(accountTitle(acct)) · \(blockedReason(acct))"
+                menu.addItem(accountItem(acct, titleOverride: title,
+                                         dotColorOverride: .systemGray, hollowDot: true))
+            }
+            menu.addItem(separatorRow())
+        }
+
+        // OTHER: no exported state (older status.json) or unknown quota —
+        // rendered as plain classic-style rows in a trailing group.
+        if !other.isEmpty {
+            menu.addItem(headerItem(t("other_header")))
+            for acct in other {
+                menu.addItem(accountItem(acct))
+            }
+            menu.addItem(separatorRow())
+        }
+
+        // Last auto-swap event (hidden placeholder until M4 exports it).
+        if let swapRow = lastSwapItem(payload) {
+            menu.addItem(swapRow)
+            menu.addItem(separatorRow())
+        }
+
+        addLiveActivityRow(menu, payload: payload)
         addFooter(menu)
+    }
+
+    /// "⇄ auto-swap: Codex → codex-2 at 16:41". Returns nil until the M4
+    /// swap engine starts exporting `last_swap` in status.json.
+    func lastSwapItem(_ payload: StatusPayload) -> NSMenuItem? {
+        guard let swap = payload.last_swap else { return nil }
+        var text = "⇄ auto-swap: " + (swap.provider.map(providerDisplayName) ?? "?")
+        if let to = swap.to { text += " → \(to)" }
+        var when: Date?
+        if let epoch = swap.at_epoch {
+            when = Date(timeIntervalSince1970: epoch)
+        } else if let at = swap.at {
+            when = StatusLoader.parseStatusDate(at)
+        }
+        if let when {
+            let out = DateFormatter()
+            out.locale = Locale(identifier: "en_US_POSIX")
+            out.dateFormat = "HH:mm"
+            text += " at \(out.string(from: when))"
+        }
+        return infoItem(text)
+    }
+
+    // ─── 1s menu ticker (usable-first countdowns) ────────────────────────
+
+    private func startMenuTicker() {
+        stopMenuTicker()
+        let ticker = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            self?.tickCountdowns()
+        }
+        // Menu tracking runs in the event-tracking run-loop mode; register
+        // for both so countdowns keep ticking while the menu is open.
+        RunLoop.main.add(ticker, forMode: .common)
+        RunLoop.main.add(ticker, forMode: .eventTracking)
+        menuTicker = ticker
+    }
+
+    func stopMenuTicker() {
+        menuTicker?.invalidate()
+        menuTicker = nil
+    }
+
+    private func tickCountdowns() {
+        let now = Date().timeIntervalSince1970
+        for (row, acct) in limitedRows {
+            row.updateTitle(limitedRowTitle(acct, now: now))
+        }
     }
 
     private func statusColor(_ status: String) -> NSColor {
@@ -1593,11 +2042,18 @@ extension AppDelegate: NSMenuDelegate {
         })
     }
 
-    func accountItem(_ acct: Account) -> NSMenuItem {
+    /// Display name used for account rows in both layouts.
+    func accountTitle(_ acct: Account) -> String {
         var title = acct.email ?? acct.label ?? "unknown"
         if acct.provider == "copilot", let mail = acct.github_email, !mail.isEmpty {
             title = "\(acct.email ?? acct.label ?? "unknown") (\(mail))"
         }
+        return title
+    }
+
+    func accountItem(_ acct: Account, titleOverride: String? = nil,
+                     dotColorOverride: NSColor? = nil, hollowDot: Bool = false) -> NSMenuItem {
+        let title = titleOverride ?? accountTitle(acct)
         let submenu = NSMenu()
         let detailWidth: CGFloat = 420
         if acct.provider == "codex" {
@@ -1638,7 +2094,8 @@ extension AppDelegate: NSMenuDelegate {
         let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         item.submenu = submenu
         let row = FixedMenuRowView(title: title, style: .submenu, submenu: submenu,
-                                   dotColor: statusColor(acct.status), badge: endSoonBadge(acct))
+                                   dotColor: dotColorOverride ?? statusColor(acct.status),
+                                   hollowDot: hollowDot, badge: endSoonBadge(acct))
         let gauges = (acct.windows ?? []).prefix(3).map { w in
             GaugeRowView(window: w,
                          color: windowRiskColor(pct: w.used_pct ?? 0,
@@ -1819,6 +2276,41 @@ extension AppDelegate: NSMenuDelegate {
         return "\(t("plan")): \(plan)"
     }
 
+    /// "2026-08-01T00:00:00+00:00" → "08-01" (local time).
+    func shortMonthDay(_ iso: String?) -> String? {
+        guard let iso, let date = StatusLoader.parseStatusDate(iso) else { return nil }
+        let out = DateFormatter()
+        out.locale = Locale(identifier: "en_US_POSIX")
+        out.dateFormat = "MM-dd"
+        return out.string(from: date)
+    }
+
+    /// Subscription lifecycle line from the exported per-account `state`:
+    /// "Plan · paid · renews 08-01" / "Plan · expired since 07-19".
+    func subscriptionLine(_ acct: Account) -> String? {
+        guard let state = acct.state, let sub = state.subscription, sub != "unknown" else { return nil }
+        let plan = normalizePlan(acct) ?? t("plan")
+        switch sub {
+        case "paid":
+            if let d = shortMonthDay(state.sub_renews_at) {
+                return "\(plan) · \(t("sub_paid")) · " + String(format: t("sub_renews"), d)
+            }
+            return "\(plan) · \(t("sub_paid"))"
+        case "renews_soon":
+            let d = shortMonthDay(state.sub_renews_at) ?? "?"
+            return "\(plan) · \(t("sub_paid")) · " + String(format: t("sub_renews_soon"), d)
+        case "free":
+            return "\(plan) · \(t("sub_free"))"
+        case "expired":
+            if let d = shortMonthDay(state.sub_expires_at) {
+                return "\(plan) · " + String(format: t("sub_expired_since"), d)
+            }
+            return "\(plan) · \(t("sub_expired"))"
+        default:
+            return nil
+        }
+    }
+
     func planStartText(_ acct: Account) -> String? {
         let start = acct.plan_start ?? acct.billing_period_start ?? acct.monthly_period_start
         if let start, !start.isEmpty {
@@ -1937,6 +2429,9 @@ extension AppDelegate: NSMenuDelegate {
         } else {
             submenu.addItem(infoItem(L10n.label("plan", na), width: width))
         }
+        if let line = subscriptionLine(acct) {
+            submenu.addItem(infoItem(line, width: width))
+        }
         submenu.addItem(infoItem(planStartText(acct) ?? L10n.label("plan_started", na), width: width))
         submenu.addItem(infoItem(planResetText(acct) ?? L10n.label("plan_resets", na), width: width))
         for (key, value) in extra {
@@ -2035,6 +2530,9 @@ extension AppDelegate: NSMenuDelegate {
         var lines: [String] = []
         if let plan = normalizePlan(acct), !plan.isEmpty {
             lines.append(L10n.label("plan", plan))
+        }
+        if let sub = subscriptionLine(acct) {
+            lines.append(sub)
         }
         if let start = planStartText(acct) {
             lines.append(start)
@@ -2140,6 +2638,7 @@ extension AppDelegate: NSMenuDelegate {
         menu.addItem(actionItem(t("refresh_display")) { [weak self] in self?.loader.reload() })
         menu.addItem(submenuRow(t("add_new_agent"), submenu: addAgentSubmenu()))
         menu.addItem(submenuRow(t("language"), submenu: languageSubmenu()))
+        menu.addItem(submenuRow(t("layout"), submenu: layoutSubmenu()))
         menu.addItem(infoItem(timezoneLabel()))
         menu.addItem(separatorRow())
         let quit = NSMenuItem(title: t("quit"), action: #selector(quitApp), keyEquivalent: "q")
@@ -2177,6 +2676,29 @@ extension AppDelegate: NSMenuDelegate {
         Language.current = lang
         language = lang
         L10n.lang = lang
+        if let menu = statusItem.menu {
+            menu.removeAllItems()
+            buildMenu(menu)
+        }
+    }
+
+    /// Layout experiment switcher (spec §2.1): both layouts with a checkmark
+    /// on the active one; switching rebuilds the menu like setLanguage does.
+    func layoutSubmenu() -> NSMenu {
+        let submenu = NSMenu()
+        let w: CGFloat = 200
+        for layout in MenuLayout.allCases {
+            let active = (layout == menuLayout)
+            submenu.addItem(actionItem(t(layout.titleKey), width: w, checkmark: active) { [weak self] in
+                self?.setMenuLayout(layout)
+            })
+        }
+        return submenu
+    }
+
+    func setMenuLayout(_ layout: MenuLayout) {
+        MenuLayout.current = layout
+        menuLayout = layout
         if let menu = statusItem.menu {
             menu.removeAllItems()
             buildMenu(menu)

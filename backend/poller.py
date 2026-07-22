@@ -1193,6 +1193,19 @@ def export_status(conn) -> None:
         # Event persistence must never break the export path the app reads.
         print(f"  lifecycle events failed: {e}")
     _prev_export_payload = payload
+    # §3.2: automatic same-provider account swap, evaluated at this single
+    # choke point after events are persisted. On a successful swap, rebuild
+    # + rewrite so the app immediately sees payload["last_swap"] (which
+    # build_payload reads back from lifecycle_events → survives restarts).
+    try:
+        import swap
+        if swap.auto_swap_tick(conn, payload):
+            payload = status.build_payload(conn)
+            status.write_status(payload)
+            _prev_export_payload = payload
+    except Exception as e:
+        # A failed swap evaluation must never break the export path either.
+        print(f"  auto-swap failed: {e}")
 
 
 def poll_account(conn, account) -> bool:

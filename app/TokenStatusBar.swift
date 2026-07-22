@@ -427,6 +427,18 @@ class StatusLoader: ObservableObject {
         }
     }
 
+    /// Manual "Swap to this account" (spec §3.2): rewrites ~/.codex/auth.json
+    /// with this pool account's tokens via `pool.py swap`. --force because a
+    /// user click is explicit intent; the backend still backs up the old
+    /// auth.json, writes atomically, records the event, and notifies.
+    func swapToAgent(_ acct: Account) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.runPool(["swap", "--provider", acct.provider,
+                          "--account-id", "\(acct.id)", "--force"])
+            self.reload()
+        }
+    }
+
     func reconnectAgent(_ acct: Account) {
         if acct.provider == "devin" {
             reconnectDevinAgent(acct)
@@ -907,6 +919,7 @@ enum L10n {
             "heartbeat_fail": "Fail",
             "heartbeat_unknown": "Unknown",
             "reconnect_agent": "Reconnect This Account",
+            "swap_to_agent": "Swap to This Account",
             "devin_api_key_title": "Reconnect Devin",
             "devin_api_key_message": "Enter the API key for this Devin account.",
             "delete_agent": "Delete This Agent",
@@ -1042,6 +1055,7 @@ enum L10n {
             "heartbeat_fail": "실패",
             "heartbeat_unknown": "알 수 없음",
             "reconnect_agent": "계정 다시 연결하기",
+            "swap_to_agent": "이 계정으로 전환하기",
             "devin_api_key_title": "Devin 다시 연결",
             "devin_api_key_message": "이 Devin 계정의 API 키를 입력하세요.",
             "delete_agent": "이 에이전트 삭제",
@@ -1177,6 +1191,7 @@ enum L10n {
             "heartbeat_fail": "失败",
             "heartbeat_unknown": "未知",
             "reconnect_agent": "重新连接此账户",
+            "swap_to_agent": "切换到此账户",
             "devin_api_key_title": "重新连接 Devin",
             "devin_api_key_message": "输入此 Devin 账户的 API 密钥。",
             "delete_agent": "删除此代理",
@@ -1312,6 +1327,7 @@ enum L10n {
             "heartbeat_fail": "失敗",
             "heartbeat_unknown": "不明",
             "reconnect_agent": "このアカウントを再接続",
+            "swap_to_agent": "このアカウントに切り替え",
             "devin_api_key_title": "Devin を再接続",
             "devin_api_key_message": "この Devin アカウントの API キーを入力してください。",
             "delete_agent": "このエージェントを削除",
@@ -2084,6 +2100,13 @@ extension AppDelegate: NSMenuDelegate {
         addHeartbeatStatus(submenu, acct: acct, width: detailWidth)
         if acct.heartbeat_status != nil || acct.heartbeat_next != nil || acct.heartbeat_last != nil {
             submenu.addItem(separatorRow(width: detailWidth))
+        }
+        // Manual same-provider swap (codex only, spec §3.2) — offered only
+        // when this account could actually take over (usable == true).
+        if acct.provider == "codex", acct.state?.usable == true {
+            submenu.addItem(actionItem(t("swap_to_agent"), width: detailWidth) { [weak self] in
+                self?.loader.swapToAgent(acct)
+            })
         }
         submenu.addItem(actionItem(t("reconnect_agent"), width: detailWidth) { [weak self] in
             self?.loader.reconnectAgent(acct)

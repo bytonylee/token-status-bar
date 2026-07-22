@@ -830,6 +830,37 @@ def account_state(item, now=None) -> dict:
     }
 
 
+def _short_ident(email_or_label) -> str | None:
+    """Short display identity for swap rows: the email local part + '@'."""
+    if not email_or_label:
+        return None
+    s = str(email_or_label)
+    return s.split("@", 1)[0] + "@" if "@" in s else s
+
+
+def last_swap_payload(conn) -> dict | None:
+    """payload["last_swap"] from the newest account_swapped lifecycle event.
+
+    Read from lifecycle_events (not in-memory swap state) so the row survives
+    daemon restarts (spec §3.2).
+    """
+    ev = store.latest_lifecycle_event(conn, "account_swapped")
+    if not ev:
+        return None
+    try:
+        detail = json.loads(ev["detail"]) if ev.get("detail") else {}
+    except ValueError:
+        detail = {}
+    ts = float(ev["ts"])
+    return {
+        "provider": detail.get("provider"),
+        "from": _short_ident(detail.get("from_email")),
+        "to": _short_ident(detail.get("to_email")),
+        "at": datetime.datetime.fromtimestamp(ts, tz=KST).strftime("%H:%M"),
+        "at_epoch": ts,
+    }
+
+
 def build_payload(conn) -> dict:
     """Build the status.json payload dict (everything cmd_export writes).
 
@@ -848,6 +879,9 @@ def build_payload(conn) -> dict:
             "provider": a["provider"],
             "email": a["email"],
             "label": a["label"],
+            # Upstream account id (chatgpt account id etc) — the swap engine
+            # matches the locally-active CLI account against this (spec §3.2).
+            "account_id": a.get("account_id"),
             "plan": (snap.get("plan") or a["plan"]) if snap else a["plan"],
             "status": snap["status"] if snap else "unknown",
             "status_message": snap["status_message"] if snap else "",
@@ -878,6 +912,9 @@ def build_payload(conn) -> dict:
                                "granted_at": c.get("granted_at"),
                                "description": c.get("description")} for c in credits],
             "last_poll": ts_fmt(snap["ts"]) if snap else None,
+            # Raw epoch of the newest snapshot: should_swap's freshness rail
+            # (spec §3.2) must not re-parse the KST-rendered last_poll string.
+            "last_poll_epoch": float(snap["ts"]) if snap else None,
             "tier_override": a.get("tier_override"),
         })
         if a["provider"] in HEARTBEAT_PROVIDERS:
@@ -909,6 +946,9 @@ def build_payload(conn) -> dict:
         "headline": select_headline(items),
         "accounts": items,
     }
+    last_swap = last_swap_payload(conn)
+    if last_swap:
+        payload["last_swap"] = last_swap
     return payload
 
 

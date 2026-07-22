@@ -19,5 +19,7 @@ for _key, _default in (
     ("AGENT_POOL_DB", os.path.join(_TMP, "pool.db")),
     ("AGENT_POOL_STATUS_JSON", os.path.join(_TMP, "status.json")),
     ("AGENT_POOL_HISTORY_DIR", os.path.join(_TMP, "history")),
+    ("AGENT_POOL_SETTINGS", os.path.join(_TMP, "settings.json")),
+    ("AGENT_POOL_SWAP_BACKUPS", os.path.join(_TMP, "swap_backups")),
 ):
     os.environ.setdefault(_key, _default)

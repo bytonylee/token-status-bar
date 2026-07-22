@@ -21,6 +21,9 @@ Usage:
   pool.py refresh <account_id>         Refresh token for one account
   pool.py refresh-all                  Refresh all expiring tokens
   pool.py reset <account_id>           Redeem a Codex banked reset credit
+  pool.py swap --provider codex --account-id <id> [--force]
+                                       Swap the local CLI onto this pool account
+                                       (--force bypasses the auto-swap safety rails)
   pool.py set-tier <account_id> <tier> Set manual tier override (e.g. 5x, 20x)
   pool.py export-status                Write status JSON for the menu bar app
   pool.py dashboard [--open]           Regenerate history/dashboard.html (--open opens it)
@@ -395,6 +398,26 @@ def main(argv):
             print("usage: pool.py reset <account_id>")
             return 1
         return poller.redeem_reset(DB, int(argv[1]))
+    if cmd == "swap":
+        args = argv[1:]
+        force = "--force" in args
+        provider, account_id = "codex", None
+        if "--provider" in args:
+            i = args.index("--provider")
+            if i + 1 < len(args):
+                provider = args[i + 1]
+        if "--account-id" in args:
+            i = args.index("--account-id")
+            if i + 1 < len(args):
+                try:
+                    account_id = int(args[i + 1])
+                except ValueError:
+                    account_id = None
+        if account_id is None:
+            print("usage: pool.py swap --provider codex --account-id <id> [--force]")
+            return 1
+        import swap
+        return swap.cmd_swap(DB, provider, account_id, force=force)
     if cmd == "vacuum":
         n_snap, n_log = store.prune_old_rows(DB)
         DB.execute("VACUUM")

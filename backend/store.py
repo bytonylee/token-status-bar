@@ -568,6 +568,15 @@ def save_lifecycle_event(conn, ts, account_id, event, detail=None) -> int:
     return cur.lastrowid
 
 
+def latest_lifecycle_event(conn, event) -> dict | None:
+    """Newest lifecycle event of one kind (e.g. the last account_swapped)."""
+    r = conn.execute(
+        "SELECT * FROM lifecycle_events WHERE event=? ORDER BY ts DESC, id DESC LIMIT 1",
+        (event,),
+    ).fetchone()
+    return dict(r) if r else None
+
+
 def list_lifecycle_events(conn, account_id=None, since=None, limit=100) -> list[dict]:
     """Lifecycle events, newest first."""
     q, conds, args = "SELECT * FROM lifecycle_events", [], []

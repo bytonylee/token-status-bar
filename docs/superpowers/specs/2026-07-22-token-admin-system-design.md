@@ -182,7 +182,7 @@ submenu. Classic stays default until then.
 | Provider | Active-account location | Swap mechanism | Status |
 |----------|------------------------|----------------|--------|
 | codex | `~/.codex/auth.json` (`tokens.account_id`, already read by `local_sync.codex_active_account_id`) | Rewrite `auth.json` with pool account's `{id_token, access_token, refresh_token, account_id}`; back up prior file | **M4 — implement** |
-| claude | macOS keychain item `Claude Code-credentials` (+ `~/.claude.json` `oauthAccount`) | `security add-generic-password -U` rewrite + patch `~/.claude.json`; needs a spike to confirm Claude Code re-reads without relogin | **M5 — flagged, after spike** |
+| claude | macOS keychain item `Claude Code-credentials` (+ `~/.claude.json` `oauthAccount`) | `add-generic-password -U` via `security -i` stdin + patch `~/.claude.json`; spike findings in §3.4 | **M5 — implemented behind `auto_swap.claude` (default off), supervised trial pending** |
 | copilot | `gh auth` / `~/.config/github-copilot/apps.json` | research only | backlog |
 | others | n/a (single account or IDE-managed) | — | out of scope |
 
@@ -226,6 +226,77 @@ def perform_swap(conn, provider, target_account) -> dict   # side effects
 `perform_swap` refreshes the target's OAuth token first if
 `expires_at < now + 10min` (existing refresh paths in `poller.py`),
 so the CLI never receives an expired token.
+
+### 3.4 M5 spike findings — Claude Code credential swap
+
+Investigated 2026-07-22 on a live macOS Claude Code install (read-only;
+key names only, no secret values). **Verdict: viable-with-supervised-trial**
+— implemented behind `auto_swap.claude` (default **off**).
+
+**Keychain item shape.** Login keychain, class `genp`, service
+`"Claude Code-credentials"`, account attribute `acct` = the macOS login
+user name (e.g. `tonylee`). No alternate service names exist
+(`"Claude Code"`, `"Claude Code credentials"`, `"claude-code"` all absent)
+and the Linux fallback `~/.claude/.credentials.json` does not exist on
+macOS. Password payload is JSON:
+
+```
+{"claudeAiOauth": {accessToken, refreshToken,
+                   expiresAt (ms epoch), refreshTokenExpiresAt (ms epoch),
+                   scopes (list of 5), subscriptionType, rateLimitTier}}
+```
+
+**`~/.claude.json`.** `oauthAccount` identifies the active account:
+`{accountUuid, emailAddress, organizationUuid, organizationName, …}`
+among ~85 unrelated top-level keys — the swap patches only the
+`oauthAccount` identity fields and preserves everything else.
+
+**Pool-token compatibility (the real viability question).** Our
+`oauth.py` claude flow uses the *same* OAuth client as Claude Code
+(client_id `9d1c250a-e61b-44d9-88ed-5944d1962f5e`) and the identical
+5-scope set (`user:profile user:inference user:sessions:claude_code
+user:mcp_servers user:file_upload`); tokens have the same `sk-ant-o…`
+shape/length, and `tokens.raw_json` carries `account.uuid`,
+`account.email_address`, `organization.{uuid,name}`,
+`refresh_token_expires_in` — everything needed to rebuild both the
+keychain payload and the `oauthAccount` patch. **Shape-compatible.**
+Note: claude pool rows may have `accounts.account_id = NULL`, so claude
+swap identity is the account *email* (matched against
+`oauthAccount.emailAddress`), not an upstream id.
+
+**Write mechanism chosen.** `add-generic-password -U` (update-in-place,
+reusing the existing item's `acct` attribute) fed through `security -i`
+*stdin* so the token JSON never appears on argv (ps-visible). Escaping
+(`\` → `\\`, `"` → `\"`) verified to round-trip a JSON payload
+byte-identically on a throwaway service name (`TSB-spike-test`:
+add → read-back-identical → -U update → delete, all rc 0). The real
+item was never written during the spike.
+
+**Residual risks (why supervised trial is required before enabling):**
+
+1. **Keychain ACL**: the existing item's ACL is held by the Claude Code
+   binary; rewriting it via `security`(1) creates a new ACL owned by
+   `security`, so Claude Code will likely show a one-time keychain
+   prompt ("Claude Code wants to use…" → *Always Allow*) on next access.
+   Not destructive, but needs a human at the screen.
+2. **Re-read behavior**: unconfirmed whether a *running* Claude Code
+   session re-reads swapped credentials without `/login`; new sessions
+   are expected to pick them up. Only a live trial answers this.
+
+**Supervised live trial (manual, run while watching the screen):**
+
+```
+python3 backend/pool.py accounts                 # find claude account db id N
+python3 backend/pool.py swap --provider claude --account-id N --force
+```
+
+Then (1) approve the keychain prompt with "Always Allow" if it appears,
+(2) start a fresh `claude` session and confirm it works and shows the
+swapped account (`/status`), (3) check an already-running session keeps
+working. Rollback: the pre-swap keychain JSON is in
+`secrets/swap_backups/claude-<ts>.json`; restore with the same
+`security -i` mechanism or re-`/login`. If the trial passes, flip
+`"auto_swap": {"claude": true}` in `secrets/settings.json`.
 
 ## 4. Retained v1 features (re-scoped)
 

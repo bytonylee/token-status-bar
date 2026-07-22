@@ -102,6 +102,19 @@ def codex_active_account_id() -> str | None:
     return tokens.get("account_id") if isinstance(tokens, dict) else None
 
 
+def claude_active_email() -> str | None:
+    """The locally-active Claude Code account: ~/.claude.json
+    oauthAccount.emailAddress, lower-cased. None when unknown/unreadable."""
+    try:
+        cfg = json.loads(CLAUDE_CONFIG.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    email = ((cfg.get("oauthAccount") or {}).get("emailAddress") or "")
+    return email.strip().lower() or None
+
+
 def match_codex_account(accounts, upstream_id) -> dict | None:
     if not upstream_id:
         return None

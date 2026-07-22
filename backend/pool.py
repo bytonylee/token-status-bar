@@ -21,7 +21,7 @@ Usage:
   pool.py refresh <account_id>         Refresh token for one account
   pool.py refresh-all                  Refresh all expiring tokens
   pool.py reset <account_id>           Redeem a Codex banked reset credit
-  pool.py swap --provider codex --account-id <id> [--force]
+  pool.py swap --provider codex|claude --account-id <id> [--force]
                                        Swap the local CLI onto this pool account
                                        (--force bypasses the auto-swap safety rails)
   pool.py set-tier <account_id> <tier> Set manual tier override (e.g. 5x, 20x)
@@ -414,7 +414,7 @@ def main(argv):
                 except ValueError:
                     account_id = None
         if account_id is None:
-            print("usage: pool.py swap --provider codex --account-id <id> [--force]")
+            print("usage: pool.py swap --provider codex|claude --account-id <id> [--force]")
             return 1
         import swap
         return swap.cmd_swap(DB, provider, account_id, force=force)

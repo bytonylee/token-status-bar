@@ -178,7 +178,7 @@ class LoadSettingsTests(unittest.TestCase):
         path = Path(_TMP) / "fresh-settings" / "settings.json"
         with mock.patch.object(swap, "SETTINGS_PATH", path):
             settings = swap.load_settings()
-        self.assertEqual(settings, {"auto_swap": {"codex": True}})
+        self.assertEqual(settings, {"auto_swap": {"codex": True, "claude": False}})
         self.assertTrue(path.exists())
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         # Second call reads the file back.
@@ -190,6 +190,25 @@ class LoadSettingsTests(unittest.TestCase):
         path.write_text("{not json")
         with mock.patch.object(swap, "SETTINGS_PATH", path):
             self.assertEqual(swap.load_settings(), {"auto_swap": {}})
+
+    def test_merge_adds_new_provider_keys_without_clobbering(self):
+        # An M4-era settings.json (codex only, flipped off by the user)
+        # gains the claude key with its OFF default; codex stays untouched.
+        path = Path(_TMP) / "m4-settings.json"
+        path.write_text(json.dumps({"auto_swap": {"codex": False},
+                                    "unrelated": 7}))
+        with mock.patch.object(swap, "SETTINGS_PATH", path):
+            settings = swap.load_settings()
+        self.assertEqual(settings["auto_swap"], {"codex": False, "claude": False})
+        self.assertEqual(settings["unrelated"], 7)
+        on_disk = json.loads(path.read_text())
+        self.assertEqual(on_disk["auto_swap"], {"codex": False, "claude": False})
+
+    def test_merge_does_not_override_existing_claude_choice(self):
+        path = Path(_TMP) / "claude-on-settings.json"
+        path.write_text(json.dumps({"auto_swap": {"codex": True, "claude": True}}))
+        with mock.patch.object(swap, "SETTINGS_PATH", path):
+            self.assertTrue(swap.load_settings()["auto_swap"]["claude"])
 
 
 class PerformSwapTests(unittest.TestCase):
@@ -314,7 +333,7 @@ class PerformSwapTests(unittest.TestCase):
 
     def test_unsupported_provider_raises(self):
         with self.assertRaises(ValueError):
-            swap.perform_swap(self.conn, "claude", self._target(), self._token())
+            swap.perform_swap(self.conn, "xai", self._target(), self._token())
 
     def test_notification_failure_never_fails_swap(self):
         swap._notify.side_effect = RuntimeError("no UI")
@@ -503,6 +522,12 @@ class CmdSwapTests(unittest.TestCase):
         self.assertEqual(swap.cmd_swap(self.conn, "codex", 999, force=True), 1)
 
     def test_unsupported_provider_fails(self):
+        self.assertEqual(swap.cmd_swap(self.conn, "xai", self.target_id,
+                                       force=True), 1)
+
+    def test_claude_provider_mismatch_fails(self):
+        # target_id is a codex account: asking for a claude swap onto it
+        # must refuse before touching anything.
         self.assertEqual(swap.cmd_swap(self.conn, "claude", self.target_id,
                                        force=True), 1)
 
@@ -521,6 +546,399 @@ class CliParsingTests(unittest.TestCase):
         import pool
         self.assertEqual(pool.main(["swap", "--provider", "codex"]), 1)
         self.assertEqual(pool.main(["swap", "--account-id", "not-a-number"]), 1)
+
+
+# ─── M5: claude swap (spec §3.4, behind auto_swap.claude) ───────────────────
+FAKE_KEYCHAIN_OLD = {
+    "claudeAiOauth": {
+        "accessToken": "fake-old-access",
+        "refreshToken": "fake-old-refresh",
+        "expiresAt": 1000,
+        "refreshTokenExpiresAt": 2000,
+        "scopes": ["user:profile"],
+        "subscriptionType": "pro",
+        "rateLimitTier": "default_claude_ai",
+    }
+}
+
+FAKE_RAW_TOKEN = {
+    "scope": "user:profile user:inference",
+    "account": {"uuid": "uuid-new", "email_address": "new@example.com"},
+    "organization": {"uuid": "org-new", "name": "New Org"},
+    "refresh_token_expires_in": 1000000,
+}
+
+
+def _fake_claude_config():
+    return {
+        "numStartups": 42,
+        "projects": {"/x": {"history": []}},
+        "mcpServers": {"foo": {"command": "bar"}},
+        "oauthAccount": {"emailAddress": "old@example.com",
+                         "accountUuid": "uuid-old",
+                         "billingType": "stripe"},
+    }
+
+
+class ClaudeActiveEmailTests(unittest.TestCase):
+    def _with_config(self, text):
+        path = Path(tempfile.mkdtemp(prefix="tsb-claude-cfg-")) / "claude.json"
+        if text is not None:
+            path.write_text(text)
+        with mock.patch.object(local_sync, "CLAUDE_CONFIG", path):
+            return local_sync.claude_active_email()
+
+    def test_reads_and_normalizes_email(self):
+        got = self._with_config(json.dumps(
+            {"oauthAccount": {"emailAddress": " Old@Example.COM "}}))
+        self.assertEqual(got, "old@example.com")
+
+    def test_missing_file_none(self):
+        self.assertIsNone(self._with_config(None))
+
+    def test_missing_oauth_account_none(self):
+        self.assertIsNone(self._with_config(json.dumps({"numStartups": 1})))
+
+    def test_non_object_config_none(self):
+        self.assertIsNone(self._with_config(json.dumps([1, 2])))
+
+
+class ClaudeCandidateTests(unittest.TestCase):
+    def test_no_upstream_account_id_still_eligible(self):
+        # Real claude pool rows can have account_id=None; identity is email.
+        it = _item(aid=2, provider="claude", upstream=None,
+                   email="b@example.com", binding=_win(used=10.0))
+        out = swap.swap_candidates([it], "claude", None,
+                                   active_email="a@example.com")
+        self.assertEqual([x["id"] for x in out], [2])
+
+    def test_active_excluded_by_email_case_insensitive(self):
+        active = _item(aid=2, provider="claude", upstream=None,
+                       email="Active@Example.com", binding=_win(used=10.0))
+        other = _item(aid=3, provider="claude", upstream=None,
+                      email="other@example.com", binding=_win(used=10.0))
+        out = swap.swap_candidates([active, other], "claude", None,
+                                   active_email="active@example.com")
+        self.assertEqual([x["id"] for x in out], [3])
+
+    def test_no_email_excluded(self):
+        it = _item(aid=2, provider="claude", upstream=None, email="x")
+        it["email"] = None
+        self.assertEqual(swap.swap_candidates([it], "claude", None), [])
+
+
+class ClaudeKeychainPayloadTests(unittest.TestCase):
+    def _token(self, raw=FAKE_RAW_TOKEN, last_refresh=NOW):
+        return {"access_token": "fake-claude-access",
+                "refresh_token": "fake-claude-refresh",
+                "expires_at": NOW + 7200, "last_refresh": last_refresh,
+                "raw_json": json.dumps(raw) if raw is not None else None}
+
+    def test_maps_token_row_and_preserves_extras(self):
+        target = {"email": "new@example.com", "plan": "Claude Max"}
+        existing = dict(FAKE_KEYCHAIN_OLD, somethingElse={"keep": True})
+        out = swap._claude_keychain_payload(existing, target, self._token())
+        oauth = out["claudeAiOauth"]
+        self.assertEqual(oauth["accessToken"], "fake-claude-access")
+        self.assertEqual(oauth["refreshToken"], "fake-claude-refresh")
+        self.assertEqual(oauth["expiresAt"], int((NOW + 7200) * 1000))
+        self.assertEqual(oauth["scopes"], ["user:profile", "user:inference"])
+        self.assertEqual(oauth["subscriptionType"], "max")  # from plan
+        self.assertEqual(oauth["rateLimitTier"], "default_claude_ai")  # kept
+        self.assertEqual(oauth["refreshTokenExpiresAt"],
+                         int((NOW + 1000000) * 1000))
+        self.assertEqual(out["somethingElse"], {"keep": True})  # top-level kept
+
+    def test_defaults_when_raw_missing(self):
+        target = {"email": "new@example.com", "plan": None}
+        out = swap._claude_keychain_payload({}, target, self._token(raw=None))
+        oauth = out["claudeAiOauth"]
+        self.assertEqual(oauth["scopes"], swap.DEFAULT_CLAUDE_SCOPES)
+        self.assertNotIn("subscriptionType", oauth)  # unknown plan → not set
+        self.assertNotIn("refreshTokenExpiresAt", oauth)
+
+    def test_unknown_plan_keeps_existing_subscription_type(self):
+        target = {"email": "new@example.com", "plan": "Mystery Tier"}
+        out = swap._claude_keychain_payload(FAKE_KEYCHAIN_OLD, target,
+                                            self._token())
+        self.assertEqual(out["claudeAiOauth"]["subscriptionType"], "pro")
+
+
+class ClaudeKeychainWriteTests(unittest.TestCase):
+    def test_secret_travels_via_stdin_not_argv(self):
+        secret = json.dumps({"claudeAiOauth": {"accessToken": "fake-secret"}})
+        ok = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(swap.subprocess, "run", return_value=ok) as run:
+            swap._keychain_write("Claude Code-credentials", "tester", secret)
+        run.assert_called_once()
+        argv = run.call_args[0][0]
+        self.assertEqual(argv, ["security", "-i"])
+        self.assertNotIn("fake-secret", " ".join(argv))
+        stdin = run.call_args[1]["input"]
+        self.assertIn("add-generic-password -U", stdin)
+        self.assertIn('-s "Claude Code-credentials"', stdin)
+        self.assertIn('-a "tester"', stdin)
+        self.assertIn("fake-secret", stdin)
+        # JSON quotes are escaped for security(1)'s parser.
+        self.assertIn('\\"accessToken\\"', stdin)
+
+    def test_nonzero_rc_raises(self):
+        bad = mock.Mock(returncode=1, stdout="", stderr="boom")
+        with mock.patch.object(swap.subprocess, "run", return_value=bad):
+            with self.assertRaises(RuntimeError):
+                swap._keychain_write("svc", "acct", "s")
+
+    def test_escape_roundtrip_characters(self):
+        self.assertEqual(swap._security_escape('a"b\\c'), 'a\\"b\\\\c')
+
+
+class ClaudePerformSwapTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = store.connect()
+        for table in ("lifecycle_events", "live_activity", "tokens", "accounts"):
+            self.conn.execute(f"DELETE FROM {table}")
+        self.conn.commit()
+        self.backups = Path(tempfile.mkdtemp(prefix="tsb-backups-"))
+        self.config = Path(tempfile.mkdtemp(prefix="tsb-claude-cfg-")) / "claude.json"
+        self.config.write_text(json.dumps(_fake_claude_config()))
+        self.old_id = store.upsert_account(self.conn, "claude", "old@example.com",
+                                           "claude #1", "Claude Pro", None)
+        self.new_id = store.upsert_account(self.conn, "claude", "new@example.com",
+                                           "claude #2", "Claude Max", None)
+        store.save_token(self.conn, self.new_id, "fake-claude-access",
+                         "fake-claude-refresh", "", time.time() + 7200,
+                         FAKE_RAW_TOKEN)
+        self._patches = [
+            mock.patch.object(local_sync, "CLAUDE_CONFIG", self.config),
+            mock.patch.object(swap, "BACKUP_DIR", self.backups),
+            mock.patch.object(swap, "_notify"),
+            mock.patch.object(swap, "_keychain_read",
+                              return_value=json.dumps(FAKE_KEYCHAIN_OLD)),
+            mock.patch.object(swap, "_keychain_account_attr",
+                              return_value="tester"),
+            mock.patch.object(swap, "_keychain_write"),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        self.conn.close()
+
+    def _swap(self, **kw):
+        return swap.perform_swap(self.conn, "claude",
+                                 store.get_account(self.conn, self.new_id),
+                                 store.get_token(self.conn, self.new_id), **kw)
+
+    def test_keychain_written_with_mapped_payload(self):
+        self._swap()
+        swap._keychain_write.assert_called_once()
+        service, acct, secret = swap._keychain_write.call_args[0]
+        self.assertEqual(service, "Claude Code-credentials")
+        self.assertEqual(acct, "tester")
+        oauth = json.loads(secret)["claudeAiOauth"]
+        self.assertEqual(oauth["accessToken"], "fake-claude-access")
+        self.assertEqual(oauth["refreshToken"], "fake-claude-refresh")
+        self.assertEqual(oauth["subscriptionType"], "max")
+        self.assertEqual(oauth["rateLimitTier"], "default_claude_ai")
+
+    def test_backup_of_keychain_json_0600(self):
+        self._swap()
+        backups = list(self.backups.glob("claude-*.json"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(json.loads(backups[0].read_text()), FAKE_KEYCHAIN_OLD)
+        self.assertEqual(stat.S_IMODE(backups[0].stat().st_mode), 0o600)
+
+    def test_config_patch_preserves_unrelated_keys(self):
+        self._swap()
+        cfg = json.loads(self.config.read_text())
+        self.assertEqual(cfg["numStartups"], 42)
+        self.assertEqual(cfg["projects"], {"/x": {"history": []}})
+        self.assertEqual(cfg["mcpServers"], {"foo": {"command": "bar"}})
+        oa = cfg["oauthAccount"]
+        self.assertEqual(oa["emailAddress"], "new@example.com")
+        self.assertEqual(oa["accountUuid"], "uuid-new")
+        self.assertEqual(oa["organizationUuid"], "org-new")
+        self.assertEqual(oa["organizationName"], "New Org")
+        self.assertEqual(oa["billingType"], "stripe")  # unrelated field kept
+
+    def test_lifecycle_event_and_summary(self):
+        out = self._swap()
+        ev = store.latest_lifecycle_event(self.conn, "account_swapped")
+        detail = json.loads(ev["detail"])
+        self.assertEqual(detail, {"provider": "claude",
+                                  "from_email": "old@example.com",
+                                  "to_email": "new@example.com",
+                                  "from_account_id": "uuid-old",
+                                  "to_account_id": "uuid-new"})
+        self.assertEqual(out["provider"], "claude")
+        self.assertTrue(out["backup"].endswith(".json"))
+
+    def test_notification_short_emails_no_tokens(self):
+        self._swap(headroom_note="62% weekly left")
+        msg = swap._notify.call_args[0][0]
+        self.assertIn("Claude swapped: old@ → new@", msg)
+        self.assertIn("(62% weekly left)", msg)
+        self.assertNotIn("fake-claude-access", msg)
+
+    def test_missing_keychain_item_no_backup_still_swaps(self):
+        swap._keychain_read.return_value = None
+        self._swap()
+        self.assertEqual(list(self.backups.glob("*.json")), [])
+        swap._keychain_write.assert_called_once()
+
+    def test_unparseable_config_left_untouched(self):
+        self.config.write_text("{not json")
+        self._swap()  # must not raise
+        self.assertEqual(self.config.read_text(), "{not json")
+
+    def test_target_without_email_raises(self):
+        target = {"id": 99, "provider": "claude", "email": None, "plan": None}
+        token = {"access_token": "fake", "expires_at": time.time() + 7200}
+        with self.assertRaises(ValueError):
+            swap.perform_swap(self.conn, "claude", target, token)
+
+
+class ClaudeAutoSwapTickTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = store.connect()
+        for table in ("lifecycle_events", "live_activity", "tokens", "accounts"):
+            self.conn.execute(f"DELETE FROM {table}")
+        self.conn.commit()
+        self.backups = Path(tempfile.mkdtemp(prefix="tsb-backups-"))
+        tmp = Path(tempfile.mkdtemp(prefix="tsb-claude-tick-"))
+        self.config = tmp / "claude.json"
+        self.config.write_text(json.dumps(_fake_claude_config()))
+        self.active_id = store.upsert_account(self.conn, "claude", "old@example.com",
+                                              "claude #1", "Claude Pro", None)
+        self.target_id = store.upsert_account(self.conn, "claude", "new@example.com",
+                                              "claude #2", "Claude Max", None)
+        store.save_token(self.conn, self.target_id, "fake-claude-access",
+                         "fake-claude-refresh", "", time.time() + 7200,
+                         FAKE_RAW_TOKEN)
+        self._patches = [
+            mock.patch.object(local_sync, "CLAUDE_CONFIG", self.config),
+            mock.patch.object(local_sync, "CODEX_AUTH", tmp / "missing-auth.json"),
+            mock.patch.object(swap, "BACKUP_DIR", self.backups),
+            mock.patch.object(swap, "_notify"),
+            mock.patch.object(swap, "_keychain_read",
+                              return_value=json.dumps(FAKE_KEYCHAIN_OLD)),
+            mock.patch.object(swap, "_keychain_account_attr",
+                              return_value="tester"),
+            mock.patch.object(swap, "_keychain_write"),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        self.conn.close()
+
+    def _payload(self, now):
+        active = _exhausted_item(aid=self.active_id, upstream=None,
+                                 email="old@example.com",
+                                 last_poll_epoch=now - 30)
+        for w in active["windows"]:
+            w["as_of_epoch"] = now - 30
+        active["provider"] = "claude"
+        cand = _item(aid=self.target_id, provider="claude", upstream=None,
+                     email="new@example.com",
+                     binding=_win(used=38.0, kind="weekly"))
+        return {"accounts": [active, cand]}
+
+    def test_kill_switch_default_off_blocks_auto_path(self):
+        # Fresh settings file → real defaults: claude must be OFF.
+        settings_path = Path(tempfile.mkdtemp(prefix="tsb-set-")) / "settings.json"
+        now = time.time()
+        with mock.patch.object(swap, "SETTINGS_PATH", settings_path):
+            out = swap.auto_swap_tick(self.conn, self._payload(now), now=now)
+        self.assertIsNone(out)
+        swap._keychain_write.assert_not_called()
+        self.assertEqual(self.config.read_text(),
+                         json.dumps(_fake_claude_config()))  # untouched
+
+    def test_enabled_swaps_matching_active_by_email(self):
+        now = time.time()
+        with mock.patch.object(swap, "load_settings",
+                               return_value={"auto_swap": {"claude": True}}):
+            out = swap.auto_swap_tick(self.conn, self._payload(now), now=now)
+        self.assertIsNotNone(out)
+        self.assertEqual(out["provider"], "claude")
+        self.assertEqual(out["to_email"], "new@example.com")
+        swap._keychain_write.assert_called_once()
+        cfg = json.loads(self.config.read_text())
+        self.assertEqual(cfg["oauthAccount"]["emailAddress"], "new@example.com")
+        msg = swap._notify.call_args[0][0]
+        self.assertIn("62% weekly left", msg)
+
+    def test_no_active_claude_email_no_swap(self):
+        self.config.unlink()
+        now = time.time()
+        with mock.patch.object(swap, "load_settings",
+                               return_value={"auto_swap": {"claude": True}}):
+            out = swap.auto_swap_tick(self.conn, self._payload(now), now=now)
+        self.assertIsNone(out)
+        swap._keychain_write.assert_not_called()
+
+
+class ClaudeCmdSwapTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = store.connect()
+        for table in ("lifecycle_events", "live_activity", "tokens", "accounts"):
+            self.conn.execute(f"DELETE FROM {table}")
+        self.conn.commit()
+        self.backups = Path(tempfile.mkdtemp(prefix="tsb-backups-"))
+        self.config = Path(tempfile.mkdtemp(prefix="tsb-claude-cmd-")) / "claude.json"
+        self.config.write_text(json.dumps(_fake_claude_config()))
+        self.active_id = store.upsert_account(self.conn, "claude", "old@example.com",
+                                              "claude #1", "Claude Pro", None)
+        self.target_id = store.upsert_account(self.conn, "claude", "new@example.com",
+                                              "claude #2", "Claude Max", None)
+        store.save_token(self.conn, self.target_id, "fake-claude-access",
+                         "fake-claude-refresh", "", time.time() + 7200,
+                         FAKE_RAW_TOKEN)
+        self._patches = [
+            mock.patch.object(local_sync, "CLAUDE_CONFIG", self.config),
+            mock.patch.object(swap, "BACKUP_DIR", self.backups),
+            mock.patch.object(swap, "_notify"),
+            mock.patch.object(swap, "_keychain_read",
+                              return_value=json.dumps(FAKE_KEYCHAIN_OLD)),
+            mock.patch.object(swap, "_keychain_account_attr",
+                              return_value="tester"),
+            mock.patch.object(swap, "_keychain_write"),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        self.conn.close()
+
+    def test_force_swaps(self):
+        rc = swap.cmd_swap(self.conn, "claude", self.target_id, force=True)
+        self.assertEqual(rc, 0)
+        swap._keychain_write.assert_called_once()
+        cfg = json.loads(self.config.read_text())
+        self.assertEqual(cfg["oauthAccount"]["emailAddress"], "new@example.com")
+        self.assertEqual(len(list(self.backups.glob("claude-*.json"))), 1)
+
+    def test_swap_to_already_active_is_noop(self):
+        store.save_token(self.conn, self.active_id, "fake-a", "fake-r", "",
+                         time.time() + 7200, FAKE_RAW_TOKEN)
+        rc = swap.cmd_swap(self.conn, "claude", self.active_id, force=True)
+        self.assertEqual(rc, 0)
+        swap._keychain_write.assert_not_called()
+        self.assertIsNone(store.latest_lifecycle_event(self.conn, "account_swapped"))
+
+    def test_non_force_refused_without_exhaustion_evidence(self):
+        with mock.patch.object(swap, "load_settings",
+                               return_value={"auto_swap": {"claude": True}}):
+            rc = swap.cmd_swap(self.conn, "claude", self.target_id, force=False)
+        self.assertEqual(rc, 1)
+        swap._keychain_write.assert_not_called()
 
 
 if __name__ == "__main__":

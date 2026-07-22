@@ -142,6 +142,15 @@ CREATE TABLE IF NOT EXISTS live_activity (
     ts REAL NOT NULL,
     payload TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS lifecycle_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    account_id INTEGER,             -- no FK: the audit trail outlives accounts
+    event TEXT NOT NULL,            -- window_reset|sub_paid|sub_expired|sub_renewed
+                                    -- |quota_exhausted|quota_recovered|account_swapped (§3.2)
+    detail TEXT                     -- JSON: event-specific context
+);
 """
 
 
@@ -544,3 +553,32 @@ def recent_events(conn, account_id, limit=10) -> list[dict]:
         "SELECT * FROM refresh_log WHERE account_id=? ORDER BY ts DESC LIMIT ?", (account_id, limit)
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ─── lifecycle events ──────────────────────────────────────────────────────
+def save_lifecycle_event(conn, ts, account_id, event, detail=None) -> int:
+    """Append one lifecycle transition event (spec §1.4). Returns the row id."""
+    if detail is not None and not isinstance(detail, str):
+        detail = json.dumps(detail)
+    cur = conn.execute(
+        "INSERT INTO lifecycle_events(ts,account_id,event,detail) VALUES(?,?,?,?)",
+        (ts, account_id, event, detail),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_lifecycle_events(conn, account_id=None, since=None, limit=100) -> list[dict]:
+    """Lifecycle events, newest first."""
+    q, conds, args = "SELECT * FROM lifecycle_events", [], []
+    if account_id is not None:
+        conds.append("account_id=?")
+        args.append(account_id)
+    if since is not None:
+        conds.append("ts>=?")
+        args.append(since)
+    if conds:
+        q += " WHERE " + " AND ".join(conds)
+    q += " ORDER BY ts DESC, id DESC LIMIT ?"
+    args.append(limit)
+    return [dict(r) for r in conn.execute(q, args).fetchall()]

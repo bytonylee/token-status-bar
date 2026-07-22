@@ -1166,10 +1166,33 @@ def poll_some(conn, accounts) -> None:
         except Exception as e:
             print(f"  ✗ poll failed {a['provider']} #{a['id']}: {e}")
     try:
-        import status
-        status.cmd_export(conn)
+        export_status(conn)
     except Exception as e:
         print(f"  export-status failed: {e}")
+
+
+# Previous export payload, kept in memory so consecutive exports within this
+# process (daemon loop, local-sync ticks) can be diffed for lifecycle events.
+# First export after startup has no baseline → detect_transitions emits [].
+_prev_export_payload: dict | None = None
+
+
+def export_status(conn) -> None:
+    """Export status.json, then detect + persist lifecycle transitions (§1.4)."""
+    global _prev_export_payload
+    import status
+    payload = status.build_payload(conn)
+    status.write_status(payload)
+    try:
+        import lifecycle
+        ts = time.time()
+        for ev in lifecycle.detect_transitions(_prev_export_payload, payload):
+            store.save_lifecycle_event(conn, ts, ev["account_id"],
+                                       ev["event"], ev["detail"])
+    except Exception as e:
+        # Event persistence must never break the export path the app reads.
+        print(f"  lifecycle events failed: {e}")
+    _prev_export_payload = payload
 
 
 def poll_account(conn, account) -> bool:
@@ -1180,8 +1203,7 @@ def poll_account(conn, account) -> bool:
     """
     ok = _poll_one(conn, account)
     try:
-        import status
-        status.cmd_export(conn)
+        export_status(conn)
     except Exception as e:
         print(f"  export-status failed: {e}")
     return ok
@@ -1250,9 +1272,9 @@ def _local_sync_tick(conn):
         return
     _next_local_scan = time.time() + LOCAL_SYNC_INTERVAL_S
     try:
-        import local_sync, status
+        import local_sync
         if local_sync.scan(conn):
-            status.cmd_export(conn)
+            export_status(conn)
     except Exception as e:
         print(f"  local sync failed: {e}")
 

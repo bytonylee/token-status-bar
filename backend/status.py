@@ -830,8 +830,13 @@ def account_state(item, now=None) -> dict:
     }
 
 
-def cmd_export(conn) -> int:
-    """Write status.json for the menu bar app to read."""
+def build_payload(conn) -> dict:
+    """Build the status.json payload dict (everything cmd_export writes).
+
+    Split from cmd_export so the poller daemon can diff consecutive payloads
+    for lifecycle transition events (lifecycle.detect_transitions, spec §1.4)
+    without re-reading the written file.
+    """
     accounts = store.list_accounts(conn)
     items = []
     for a in accounts:
@@ -904,6 +909,11 @@ def cmd_export(conn) -> int:
         "headline": select_headline(items),
         "accounts": items,
     }
+    return payload
+
+
+def write_status(payload) -> None:
+    """Atomically write one payload dict to STATUS_JSON (0o600)."""
     STATUS_JSON.parent.mkdir(parents=True, exist_ok=True)
     # Atomic replace so readers (Swift app polls every 30s) never see a
     # partially written file; 0o600 keeps account data private.
@@ -918,5 +928,10 @@ def cmd_export(conn) -> int:
         os.chmod(STATUS_JSON, 0o600)
     except OSError:
         pass
-    print(f"Wrote {STATUS_JSON} ({len(items)} accounts)")
+    print(f"Wrote {STATUS_JSON} ({payload['account_count']} accounts)")
+
+
+def cmd_export(conn) -> int:
+    """Write status.json for the menu bar app to read."""
+    write_status(build_payload(conn))
     return 0

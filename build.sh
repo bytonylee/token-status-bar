@@ -44,6 +44,8 @@ for f in "$DIR/backend/"*.py; do
   [[ "$(basename "$f")" == test_* ]] && continue
   cp "$f" "$APP_DIR/Contents/Resources/backend/"
 done
+# Bundle the browser accounts panel served by `pool.py server`.
+cp "$DIR/backend/panel.html" "$APP_DIR/Contents/Resources/backend/"
 
 # Bundle standalone Python if not already cached.
 if [[ ! -d "$PY_CACHE/python/bin" ]]; then

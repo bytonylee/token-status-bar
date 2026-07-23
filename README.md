@@ -2,10 +2,10 @@
   <img src="./public/assets/readme/token-status-bar-icon.png" alt="Token Status Bar app icon on transparent background" width="140">
 </p>
 
-<h1 align="center">Token Status Bar</h1>
+<h1 align="center">TokenBar</h1>
 
 <p align="center">
-  <em>Real-time token / quota status for multiple AI coding-agent accounts, in one macOS menu bar.</em>
+  <em>Token status for every AI user. Straight from your macOS menu bar.</em>
 </p>
 
 <p align="center">
@@ -30,11 +30,13 @@
 
 ---
 
-> *Token Status Bar shows real-time token and quota status for every AI coding-agent
-> account you own — OpenAI Codex, Anthropic Claude, xAI / Grok, Google
-> Antigravity, GitHub Copilot, and Devin — in a single macOS menu bar. A Python
-> backend polls each provider's usage API; a lightweight Swift menu-bar app
-> renders it.*
+> *TokenBar manages every AI coding-agent account you own — OpenAI Codex,
+> Anthropic Claude, xAI / Grok, Google Antigravity, GitHub Copilot, and Devin
+> — from a single macOS menu bar. Every poll classifies each account's exact
+> subscription (paid / free / expired / renews-soon) and quota (ok / warning /
+> exhausted) state, rolls stale windows forward the moment they reset, and can
+> automatically swap credentials to a fresh account when the active one runs
+> dry — so you're never caught mid-work with a dead token.*
 
 Click the menu to see providers grouped with a green / yellow / red
 availability dot per account, drill into a per-account submenu, or hit
@@ -62,6 +64,14 @@ where a real API exists.**
   local sync) plus on-demand **Poll Now**.
 - One-click **Add New Agent** onboarding — browser OAuth in the background,
   Copilot's device-code flow in Terminal, Devin via an in-app API-key prompt.
+- Exact subscription and quota state every poll — stale windows roll forward
+  the moment they reset, so the dot never lies.
+- Zero-touch account swap — when the active Codex account exhausts its
+  quota, TokenBar automatically swaps in a usable same-provider account
+  (guardrails: cooldown, no swap on stale data or mid-session, notified
+  every time).
+- Full lifecycle audit trail — every reset, paid/expired transition, and
+  swap is recorded and queryable.
 
 ## Supported providers
 

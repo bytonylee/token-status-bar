@@ -154,13 +154,13 @@ CREATE TABLE IF NOT EXISTS lifecycle_events (
 """
 
 
-def connect() -> sqlite3.Connection:
+def connect(check_same_thread: bool = True) -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         os.chmod(DB_PATH.parent, 0o700)
     except OSError:
         pass
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn = sqlite3.connect(str(DB_PATH), timeout=10, check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")

@@ -199,6 +199,11 @@ class StatusLoader: ObservableObject {
     private let poolDir: String
     private let dataDir: String
     let statusURL: URL
+    // Persistent local control server (opencodex-style): the app launches
+    // `pool.py server` once and drives all add/reconnect/manage flows through
+    // the browser panel it serves on this loopback port.
+    private var serverProcess: Process?
+    let serverPort: Int
 
     init() {
         let env = ProcessInfo.processInfo.environment
@@ -212,6 +217,11 @@ class StatusLoader: ObservableObject {
         self.poolDir = poolDir
         let dataDir = "\(poolDir)/secrets"
         self.dataDir = dataDir
+        if let override = env["AGENT_POOL_SERVER_PORT"], let p = Int(override) {
+            self.serverPort = p
+        } else {
+            self.serverPort = 7817
+        }
         if let override = env["AGENT_POOL_STATUS_JSON"], !override.isEmpty {
             self.statusURL = URL(fileURLWithPath: override)
         } else {
@@ -221,6 +231,7 @@ class StatusLoader: ObservableObject {
 
     func start() {
         reload()
+        ensureServer()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.reload()
         }
@@ -229,6 +240,45 @@ class StatusLoader: ObservableObject {
     func stop() {
         timer?.invalidate()
         timer = nil
+        if let proc = serverProcess, proc.isRunning {
+            proc.terminate()
+        }
+        serverProcess = nil
+    }
+
+    /// Start the local control server if it is not already running. The server
+    /// binds 127.0.0.1:serverPort and serves the accounts panel + /api/oauth/*.
+    /// Launch failure is non-fatal: the menu bar still reads status.json.
+    func ensureServer() {
+        if let proc = serverProcess, proc.isRunning { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let proc = self.poolProcess(["server"])
+            proc.terminationHandler = { [weak self] _ in
+                self?.serverProcess = nil
+            }
+            do {
+                try proc.run()
+                self.serverProcess = proc
+            } catch {
+                NSLog("token-bar server failed to launch: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// URL of the browser accounts panel.
+    var panelURL: URL { URL(string: "http://127.0.0.1:\(serverPort)/")! }
+
+    /// Ensure the server is up, then open the browser accounts panel. All
+    /// add / reconnect / swap / remove happens there (opencodex parity).
+    func openPanel() {
+        ensureServer()
+        let url = panelURL
+        // Small delay on cold start so the first open lands after the bind.
+        let delay: DispatchTimeInterval = serverProcess?.isRunning == true ? .milliseconds(0) : .milliseconds(600)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     func reload() {
@@ -413,18 +463,14 @@ class StatusLoader: ObservableObject {
             }
             return
         }
-        // Copilot uses the device flow: the backend prints a code the user
-        // must enter at github.com/login/device, so it needs a Terminal.
+        // Copilot uses the GitHub device flow (paste a code): keep the Terminal
+        // path — the browser panel drives loopback-callback OAuth only.
         if provider == "copilot" {
             runPoolInTerminal(["add", provider])
             return
         }
-        // Other providers use browser OAuth — run in background, then
-        // reload after the backend exports status.json.
-        DispatchQueue.global(qos: .userInitiated).async {
-            self.runPool(["add", provider])
-            self.reload()
-        }
+        // Every other provider is browser OAuth: hand off to the accounts panel.
+        openPanel()
     }
 
     /// Manual "Swap to this account" (spec §3.2): rewrites ~/.codex/auth.json
@@ -448,10 +494,9 @@ class StatusLoader: ObservableObject {
             runPoolInTerminal(["reconnect", "\(acct.id)"])
             return
         }
-        DispatchQueue.global(qos: .userInitiated).async {
-            self.runPool(["reconnect", "\(acct.id)"])
-            self.reload()
-        }
+        // Browser OAuth providers reconnect through the accounts panel, which
+        // deep-reauths the exact account via /api/oauth/login?account_id=…
+        openPanel()
     }
 
     /// Modal secure-field prompt for a Devin API key. Returns nil on cancel/empty.
@@ -908,6 +953,7 @@ enum L10n {
             "open_dashboard": "Open Dashboard",
             "refresh_display": "Refresh Display",
             "add_new_agent": "Add New Agent",
+            "manage_accounts": "Manage Accounts…",
             "language": "Language",
             "quit": "Quit",
             "heartbeat": "Heartbeat",
@@ -1044,6 +1090,7 @@ enum L10n {
             "open_dashboard": "대시보드 열기",
             "refresh_display": "표시 새로고침",
             "add_new_agent": "새 에이전트 추가",
+            "manage_accounts": "계정 관리…",
             "language": "언어",
             "quit": "종료",
             "heartbeat": "Heartbeat",
@@ -1180,6 +1227,7 @@ enum L10n {
             "open_dashboard": "打开仪表盘",
             "refresh_display": "刷新显示",
             "add_new_agent": "添加新代理",
+            "manage_accounts": "管理账户…",
             "language": "语言",
             "quit": "退出",
             "heartbeat": "Heartbeat",
@@ -1316,6 +1364,7 @@ enum L10n {
             "open_dashboard": "ダッシュボードを開く",
             "refresh_display": "表示を更新",
             "add_new_agent": "新しいエージェントを追加",
+            "manage_accounts": "アカウントを管理…",
             "language": "言語",
             "quit": "終了",
             "heartbeat": "Heartbeat",
@@ -2657,6 +2706,7 @@ extension AppDelegate: NSMenuDelegate {
 
     func addFooter(_ menu: NSMenu) {
         menu.addItem(actionItem(t("poll_now")) { [weak self] in self?.loader.runPoll() })
+        menu.addItem(actionItem(t("manage_accounts")) { [weak self] in self?.loader.openPanel() })
         menu.addItem(actionItem(t("open_dashboard")) { [weak self] in self?.loader.runDashboard() })
         menu.addItem(actionItem(t("refresh_display")) { [weak self] in self?.loader.reload() })
         menu.addItem(submenuRow(t("add_new_agent"), submenu: addAgentSubmenu()))
@@ -2731,13 +2781,10 @@ extension AppDelegate: NSMenuDelegate {
     func addAgentSubmenu() -> NSMenu {
         let submenu = NSMenu()
         let w: CGFloat = 200
-        // OAuth (browser/device-flow) providers
-        let oauthProviders = [("Codex", "codex"), ("Claude", "claude"), ("Grok", "xai"),
-                              ("Antigravity", "antigravity"), ("GitHub Copilot", "copilot")]
-        for (title, provider) in oauthProviders {
-            submenu.addItem(actionItem(title, width: w) { [weak self] in self?.loader.addAgent(provider: provider) })
-        }
-        // Devin uses an API key, not OAuth
+        // Browser panel (opencodex-style): all OAuth add/reconnect/manage
+        // happens in the accounts page the local server serves.
+        submenu.addItem(actionItem(t("manage_accounts"), width: w) { [weak self] in self?.loader.openPanel() })
+        // Devin uses an API key, not OAuth — keep the in-app secure prompt.
         submenu.addItem(separatorRow(width: w))
         submenu.addItem(actionItem("Devin (API key)…", width: w) { [weak self] in self?.loader.addAgent(provider: "devin") })
         return submenu

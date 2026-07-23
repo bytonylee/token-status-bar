@@ -640,6 +640,13 @@ def poll_copilot(conn, account, token):
         st, resp, hdrs = _get(token_url, token_hdrs)
     if st != 200 or not isinstance(resp, dict):
         msg = f"token refresh HTTP {st}: {str(resp)[:120]}"
+        # A "subscription has ended" 403 is permanent (plan lapsed/cancelled),
+        # not a transient entitlement re-check: never hold the stale snapshot.
+        if "subscription has ended" in str(resp).lower():
+            snap = {"status": "error", "status_message": "Copilot subscription has ended"}
+            store.save_snapshot(conn, account["id"], snap)
+            store.log_event(conn, account["id"], "limit_poll", False, snap["status_message"])
+            return
         prior = store.latest_snapshot(conn, account["id"])
         if prior and prior.get("status") == "active":
             # Hold the last good snapshot; log the transient failure for audit.

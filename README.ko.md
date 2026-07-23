@@ -2,10 +2,10 @@
   <img src="./public/assets/readme/token-status-bar-icon.png" alt="투명 배경의 토큰 상태 표시줄 앱 아이콘" width="140">
 </p>
 
-<h1 align="center">Token Status Bar</h1>
+<h1 align="center">TokenBar</h1>
 
 <p align="center">
-  <em>여러 AI 코딩 에이전트 계정의 실시간 토큰 / 쿼터 상태를 macOS 메뉴 막대 한 곳에서.</em>
+  <em>모든 AI 사용자를 위한 토큰 상태. macOS 메뉴 막대에서 바로.</em>
 </p>
 
 <p align="center">
@@ -30,11 +30,13 @@
 
 ---
 
-> *토큰 상태 표시줄은 보유한 모든 AI 코딩 에이전트 계정 — OpenAI Codex, Anthropic
-> Claude, xAI / Grok, Google Antigravity, GitHub Copilot, Devin — 의 실시간
-> 토큰과 쿼터 상태를 하나의 macOS 메뉴 막대에서 보여줍니다. Python 백엔드가
-> 각 제공자의 사용량 API를 폴링하고, 가벼운 Swift 메뉴 막대 앱이 이를
-> 표시합니다.*
+> *TokenBar는 보유한 모든 AI 코딩 에이전트 계정 — OpenAI Codex, Anthropic
+> Claude, xAI / Grok, Google Antigravity, GitHub Copilot, Devin — 을 하나의
+> macOS 메뉴 막대에서 관리합니다. 매 폴링마다 각 계정의 정확한 구독 상태
+> (유료 / 무료 / 만료 / 곧 갱신)와 쿼터 상태(정상 / 경고 / 소진)를 판정하고,
+> 리셋된 윈도우는 그 즉시 롤포워드하며, 활성 계정이 소진되면 사용 가능한
+> 계정으로 자격증명을 자동 스왑합니다 — 작업 도중 죽은 토큰에 발목 잡힐
+> 일이 없습니다.*
 
 메뉴를 열면 제공자별로 묶인 초록 / 노랑 / 빨강 가용성 점을 볼 수 있고,
 계정별 하위 메뉴로 들어가거나 **Poll Now**로 즉시 갱신할 수 있습니다.
@@ -59,6 +61,13 @@ API가 있으면 스크래핑하지 않습니다.**
 - 백그라운드 폴러(기본 5분 주기, hot 계정 60초, 로컬 동기화 약 15초)와 즉시 실행용 **Poll Now**.
 - **Add New Agent** 한 번으로 온보딩 — 브라우저 OAuth는 백그라운드에서,
   Copilot 디바이스 코드 플로우는 터미널에서, Devin은 앱 내 API 키 입력으로 실행.
+- 매 폴링마다 정확한 구독/쿼터 상태 판정 — 리셋된 윈도우는 그 즉시 롤포워드되어
+  점 표시가 절대 거짓말하지 않음.
+- 무개입 계정 자동 스왑 — 활성 Codex 계정의 쿼터가 소진되면 같은 제공자의
+  사용 가능한 계정으로 자동 전환(가드레일: 쿨다운, stale 데이터·세션 중 스왑
+  방지, 매번 알림).
+- 전체 lifecycle 감사 로그 — 모든 리셋, 유료화/만료 전환, 스왑 이력을 기록하고
+  조회 가능.
 
 ## 지원 제공자
 

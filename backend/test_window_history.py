@@ -418,8 +418,81 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("<table", html)
         self.assertNotIn('src="http', html)      # no CDN / external requests
         self.assertNotIn("src='http", html)
-        self.assertNotIn('href="http', html)
         self.assertNotIn("@import", html)
+
+    def test_generate_includes_verified_public_reset_archive(self):
+        conn = store.connect()
+        path = dashboard.generate(conn)
+        html = path.read_text()
+        self.assertIn("const BANKED =", html)
+        self.assertIn("const RESET_POSTS =", html)
+        self.assertIn("2026-07-21 16:47:15", html)
+        self.assertIn("2079609157934886975", html)
+        self.assertNotIn("__ARCHIVE_AS_OF__", html)
+        self.assertNotIn("__POLICY_URL__", html)
+
+    def test_public_archive_x_timestamps_match_post_ids(self):
+        rows = (
+            dashboard.reset_announcements.BANKED_ISSUANCES
+            + dashboard.reset_announcements.RESET_POSTS
+        )
+        for row in rows:
+            post_id = int(row["source_url"].rsplit("/", 1)[-1])
+            epoch_ms = (post_id >> 22) + 1_288_834_974_657
+            actual = datetime.datetime.fromtimestamp(
+                epoch_ms / 1000, datetime.timezone.utc
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            self.assertEqual(actual, row["posted_at_utc"], row["source_url"])
+
+    def test_coupon_data_marks_elapsed_available_credit_expired(self):
+        conn = store.connect()
+        acct_id = store.upsert_account(
+            conn, "codex", f"coupon-expired-{id(self)}@example.com", "coupon", plan="pro"
+        )
+        store.upsert_credit_history(conn, acct_id, [{
+            "id": "elapsed-credit",
+            "title": "Full reset",
+            "description": "Thanks for using Codex",
+            "granted_at": "2026-06-01T00:00:00Z",
+            "expires_at": "2026-07-01T00:00:00Z",
+        }], fetched_at=1_000.0)
+        rows = dashboard.coupon_data(
+            conn, now=datetime.datetime(2026, 7, 24, tzinfo=datetime.timezone.utc)
+        )
+        row = next(r for r in rows if r["credit_id"] == "elapsed-credit")
+        self.assertEqual(row["status"], "expired")
+
+    def test_coupon_data_normalizes_expired_unused_status(self):
+        conn = store.connect()
+        acct_id = store.upsert_account(
+            conn, "codex", f"coupon-final-{id(self)}@example.com", "coupon", plan="pro"
+        )
+        store.upsert_credit_history(conn, acct_id, [{
+            "id": "expired-credit",
+            "title": "Full reset",
+            "granted_at": "2026-06-01T00:00:00Z",
+            "expires_at": "2026-07-01T00:00:00Z",
+        }], fetched_at=1_000.0)
+        store.mark_credit_final(conn, acct_id, "expired-credit", "expired_unused")
+        row = next(r for r in dashboard.coupon_data(conn) if r["credit_id"] == "expired-credit")
+        self.assertEqual(row["status"], "expired")
+
+    def test_account_data_includes_subscription_timestamps(self):
+        conn = store.connect()
+        email = f"sub-{id(self)}@example.com"
+        acct_id = store.upsert_account(conn, "codex", email, "sub", plan="Pro")
+        store.upsert_subscription_meta(
+            conn, acct_id,
+            paid_since="2026-06-09T00:05:39Z",
+            renews_at="2026-08-09T14:59:59Z",
+            account_created_at="2023-06-06T14:41:24Z",
+            has_active_subscription=True,
+        )
+        row = next(r for r in dashboard.account_data(conn) if r["account_id"] == acct_id)
+        self.assertEqual(row["email"], email)
+        self.assertEqual(row["plan"], "Pro")
+        self.assertEqual(row["auto_renew"], "yes")
+        self.assertEqual(row["renews_at"], "2026-08-09T14:59:59Z")
 
     def test_generate_excludes_5h_windows(self):
         conn = store.connect()

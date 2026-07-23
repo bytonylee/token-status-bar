@@ -61,6 +61,35 @@ def _read_api_key(prompt="API key: ") -> str:
         return ""
 
 
+def save_oauth_result(conn, provider, result, label=None, reconnect_id=None,
+                      poll=True) -> int:
+    """Persist an OAuth/login result and (optionally) poll immediately.
+
+    Shared by the CLI onboarding commands and the local server so a browser-
+    driven login writes exactly the same rows a terminal login would. Returns
+    the account id. Collision handling for reconnect stays with the caller.
+    """
+    email = result.get("email") or "unknown"
+    if reconnect_id is None:
+        if label is None:
+            existing = len([a for a in store.list_accounts(conn) if a["provider"] == provider])
+            label = f"{provider} #{existing + 1}"
+        acct_id = store.upsert_account(conn, provider, email, label,
+                                       result.get("plan"), result.get("account_id"))
+        kind = "onboard"
+    else:
+        acct_id = int(reconnect_id)
+        store.update_account(conn, acct_id, email, result.get("plan"), result.get("account_id"))
+        kind = "reconnect"
+    store.save_token(conn, acct_id, result["access_token"], result.get("refresh_token"),
+                     result.get("id_token"), result.get("expires_at"), result.get("raw"))
+    store.log_event(conn, acct_id, kind, True, f"{provider} {email}")
+    if poll:
+        import poller
+        poller.poll_account(conn, store.get_account(conn, acct_id))
+    return acct_id
+
+
 # ─── add ───────────────────────────────────────────────────────────────────
 def cmd_add(provider, label=None, incognito=False):
     if provider == "devin":
@@ -80,10 +109,8 @@ def cmd_add(provider, label=None, incognito=False):
         store.log_event(DB, None, "onboard", False, str(e))
         return 1
     email = result.get("email") or "unknown"
-    acct_id = store.upsert_account(DB, provider, email, label, result.get("plan"), result.get("account_id"))
-    store.save_token(DB, acct_id, result["access_token"], result.get("refresh_token"),
-                     result.get("id_token"), result.get("expires_at"), result.get("raw"))
-    store.log_event(DB, acct_id, "onboard", True, f"{provider} {email}")
+    # Poll separately below so the "Fetching…" line still prints in order.
+    acct_id = save_oauth_result(DB, provider, result, label=label, poll=False)
     print(f"✓ Saved: {provider} / {email} (account #{acct_id})")
     # Poll immediately so the new account has subscription data right away
     # instead of waiting for the next 5-minute poll cycle.
@@ -374,6 +401,15 @@ def main(argv):
     if cmd == "export-status":
         import status
         return status.cmd_export(DB)
+    if cmd == "server":
+        import server
+        args = argv[1:]
+        port = int(os.environ.get("AGENT_POOL_SERVER_PORT", server.DEFAULT_PORT))
+        if "--port" in args:
+            i = args.index("--port")
+            if i + 1 < len(args):
+                port = int(args[i + 1])
+        return server.serve(port=port)
     if cmd == "dashboard":
         import subprocess
         import dashboard

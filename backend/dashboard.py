@@ -5,7 +5,9 @@ offline from file://. Regenerated only when window_history gains rows or on
 demand via `pool.py dashboard [--open]`, never on ordinary poll ticks.
 """
 from __future__ import annotations
+import datetime
 import json
+import reset_announcements
 import store
 import window_history
 from window_history import HISTORY_DIR, fmt_local
@@ -67,23 +69,79 @@ def dashboard_data(conn) -> list[dict]:
     return rows
 
 
-def coupon_data(conn) -> list[dict]:
+def _coupon_status(row: dict, now: datetime.datetime | None = None) -> str:
+    """Normalize ledger states and expire stale available rows at render time."""
+    state = row.get("final_state") or "available"
+    if state == "expired_unused":
+        return "expired"
+    if state != "available":
+        return state
+    expires_at = row.get("expires_at")
+    if not expires_at:
+        return state
+    try:
+        expires = datetime.datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return state
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return "expired" if expires <= now.astimezone(datetime.timezone.utc) else state
+
+
+def coupon_data(conn, now: datetime.datetime | None = None) -> list[dict]:
     """Codex reset-credit ledger: every credit ever seen, with its final state."""
     rows = []
+    accounts = {a["id"]: a for a in store.list_accounts(conn)}
     for r in store.list_credit_history(conn, provider="codex"):
+        account = accounts.get(r["account_id"], {})
+        snap = store.latest_snapshot(conn, r["account_id"])
+        description = r["description"] or ""
+        credit_type = "referral" if "invit" in description.lower() else "usage reward"
         rows.append({
             "provider": r["provider"],
-            "account": r["email"] or r["label"] or f"#{r['account_id']}",
+            "account": f"#{r['account_id']} " + (
+                r["email"] or r["label"] or f"account {r['account_id']}"
+            ),
+            "plan": (snap.get("plan") if snap else None) or account.get("plan") or "",
             "credit_id": r["credit_id"],
             "title": r["title"] or "",
-            "description": r["description"] or "",
+            "credit_type": credit_type,
+            "description": description or r["title"] or "",
             "granted_at": r["granted_at"] or "",
             "expires_at": r["expires_at"] or "",
-            "first_seen_at": fmt_local(r["first_seen_at"]),
-            "last_seen_at": fmt_local(r["last_seen_at"]),
+            "first_seen_at": r["first_seen_at"],
+            "last_seen_at": r["last_seen_at"],
             "final_state": r["final_state"] or "available",
-            "final_seen_at": fmt_local(r["final_seen_at"]) if r["final_seen_at"] else "",
-            "redeemed_at": fmt_local(r["redeemed_at"]) if r["redeemed_at"] else "",
+            "status": _coupon_status(r, now=now),
+            "final_seen_at": r["final_seen_at"] or None,
+            "redeemed_at": r["redeemed_at"] or None,
+        })
+    rows.sort(key=lambda row: (row["granted_at"], row["account"], row["credit_id"]))
+    for number, row in enumerate(rows, start=1):
+        row["number"] = number
+    return rows
+
+
+def account_data(conn) -> list[dict]:
+    """Codex subscription rows for the account table, kept in raw UTC/ISO."""
+    rows = []
+    for account in store.list_accounts(conn):
+        if account["provider"] != "codex":
+            continue
+        snap = store.latest_snapshot(conn, account["id"])
+        meta = store.get_subscription_meta(conn, account["id"]) or {}
+        active = meta.get("has_active_subscription")
+        rows.append({
+            "account_id": account["id"],
+            "email": account["email"] or account["label"] or f"#{account['id']}",
+            "plan": (snap.get("plan") if snap else None) or account["plan"] or "",
+            "paid_since": meta.get("paid_since") or "",
+            "renews_at": meta.get("renews_at") or meta.get("expires_at") or "",
+            "auto_renew": "yes" if active and meta.get("renews_at") else (
+                "no" if active is not None else ""
+            ),
+            "account_created_at": meta.get("account_created_at") or "",
         })
     return rows
 
@@ -94,8 +152,26 @@ def generate(conn):
     path = HISTORY_DIR / "dashboard.html"
     data = json.dumps(dashboard_data(conn)).replace("</", "<\\/")
     coupons = json.dumps(coupon_data(conn)).replace("</", "<\\/")
+    accounts = json.dumps(account_data(conn)).replace("</", "<\\/")
+    banked_rows = [
+        {**row, "number": index}
+        for index, row in enumerate(reset_announcements.BANKED_ISSUANCES, start=1)
+    ]
+    reset_rows = [
+        {**row, "number": index}
+        for index, row in enumerate(reset_announcements.RESET_POSTS, start=1)
+    ]
+    banked = json.dumps(banked_rows).replace("</", "<\\/")
+    reset_posts = json.dumps(reset_rows).replace("</", "<\\/")
+    reset_notes = json.dumps(reset_announcements.RESET_NOTES).replace("</", "<\\/")
     html = _HTML_TEMPLATE.replace("/*__DATA__*/[]", data)
     html = html.replace("/*__COUPONS__*/[]", coupons)
+    html = html.replace("/*__ACCOUNTS__*/[]", accounts)
+    html = html.replace("/*__BANKED__*/[]", banked)
+    html = html.replace("/*__RESET_POSTS__*/[]", reset_posts)
+    html = html.replace("/*__RESET_NOTES__*/[]", reset_notes)
+    html = html.replace("__ARCHIVE_AS_OF__", reset_announcements.AS_OF_UTC)
+    html = html.replace("__POLICY_URL__", reset_announcements.POLICY_URL)
     window_history.atomic_write_text(path, html)
     return path
 
@@ -112,7 +188,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token window history</title>
+<title>Codex accounts and reset history</title>
 <style>
   :root {
     --plane:      #f9f9f7;
@@ -137,8 +213,10 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     --cause-ongoing:        #6b6bf0;
     --coupon-available:        #0ca30c;
     --coupon-redeemed:         #2a78d6;
-    --coupon-expired_unused:   #e34948;
+    --coupon-expired:          #e34948;
     --coupon-gone:             #898781;
+    --accent-blue:             #087bc1;
+    --accent-green:            #008f4c;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -159,9 +237,11 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
       --prov-other:       #898781;
       --coupon-available:        #0ca30c;
       --coupon-redeemed:         #3987e5;
-      --coupon-expired_unused:   #e66767;
+      --coupon-expired:          #e66767;
       --coupon-gone:             #898781;
       --cause-ongoing:        #8a8af0;
+      --accent-blue:          #39aaf0;
+      --accent-green:         #35d07f;
     }
   }
   * { box-sizing: border-box; }
@@ -173,11 +253,15 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   }
   h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
   .sub { color: var(--secondary); margin: 0 0 20px; }
+  a { color: var(--accent-blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
   .card {
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 10px; padding: 16px; margin-bottom: 20px;
+    border-radius: 8px; padding: 16px; margin-bottom: 20px;
   }
   h2 { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
+  h2.accounts-title { color: var(--accent-blue); }
+  h2.reset-title { color: var(--accent-green); }
   .card-sub { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
   .filters { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
   .filters label { display: flex; flex-direction: column; gap: 4px;
@@ -214,6 +298,11 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   th:hover { color: var(--primary); }
   th .arrow { color: var(--muted); font-size: 10px; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .data-table { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; }
+  .data-table td.wrap { min-width: 320px; white-space: normal; }
+  .data-table td.source { text-align: center; }
+  .policy-note { color: var(--secondary); font-size: 12px; margin: 10px 0 0; }
+  .policy-note strong { color: var(--primary); }
   .table-wrap { overflow-x: auto; }
   .empty { color: var(--secondary); padding: 40px 8px; text-align: center; }
   .empty code { background: var(--plane); border: 1px solid var(--border);
@@ -223,17 +312,49 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Token window history</h1>
-<p class="sub">Final usage of every weekly/monthly quota window at the moment it closed, with why it reset. (5h windows are excluded — they reset too often to be useful here.)</p>
+<h1>Codex accounts and reset history (UTC)</h1>
+<p class="sub">Local subscription and coupon data, plus a source-linked public reset archive checked through __ARCHIVE_AS_OF__ UTC.</p>
 
 <div id="app">
-  <div class="filters">
+  <section class="card" id="account-card">
+    <h2 class="accounts-title">Subscriptions</h2>
+    <p class="card-sub">Current Codex account metadata. All dates below are rendered in UTC.</p>
+    <div class="table-wrap"><table class="data-table" id="account-table"></table></div>
+  </section>
+
+  <section class="card" id="coupon-card">
+    <h2 class="reset-title">Reset coupon issuance history</h2>
+    <p class="card-sub">Every banked reset credit observed locally, including expired coupons. <span id="coupon-summary"></span></p>
+    <div class="table-wrap"><table class="data-table" id="coupon-table"></table></div>
+    <p class="note" id="coupon-empty" hidden>No reset credits archived yet.</p>
+  </section>
+
+  <section class="card">
+    <h2 class="reset-title">Banked reset issuance history</h2>
+    <p class="card-sub">Public launches, compensation grants, and milestone grants. This is an announcement archive, not proof that every account received each grant.</p>
+    <div class="table-wrap"><table class="data-table" id="banked-table"></table></div>
+    <p class="policy-note"><strong>Policy:</strong> banked referral resets normally expire 30 days after grant unless the offer says otherwise. <a href="__POLICY_URL__" target="_blank" rel="noreferrer">OpenAI terms</a></p>
+  </section>
+
+  <section class="card">
+    <h2 class="reset-title">Full reset and reset-related posts</h2>
+    <p class="card-sub"><span id="reset-post-summary"></span> Includes completed resets, banked grants, and explicit reset announcements; original posts are linked per row.</p>
+    <div class="table-wrap"><table class="data-table" id="reset-post-table"></table></div>
+  </section>
+
+  <section class="card">
+    <h2>Interpretation notes</h2>
+    <p class="card-sub">Important limits when comparing public announcements with what an individual account received.</p>
+    <div class="table-wrap"><table id="reset-note-table"></table></div>
+  </section>
+
+  <div class="filters" id="window-filters">
     <label>Provider<select id="f-provider"></select></label>
     <label>Account<select id="f-account"></select></label>
     <label>Window<select id="f-kind"></select></label>
   </div>
 
-  <section class="card">
+  <section class="card" id="window-chart-card">
     <h2>Usage at window close</h2>
     <p class="card-sub">One bar per closed window, ordered by close time. Height is final used %.</p>
     <div class="legend" id="legend"></div>
@@ -241,28 +362,21 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     <p class="note" id="chart-empty" hidden>No windows match the current filters.</p>
   </section>
 
-  <section class="card">
+  <section class="card" id="window-table-card">
     <div class="table-wrap"><table id="table"></table></div>
     <p class="note" id="table-empty" hidden>No windows match the current filters.</p>
   </section>
-
-  <section class="card" id="coupon-card">
-    <h2>Reset coupon ledger (Codex)</h2>
-    <p class="card-sub">Every banked reset credit ever observed, with its final state. <span id="coupon-summary"></span></p>
-    <div class="table-wrap"><table id="coupon-table"></table></div>
-    <p class="note" id="coupon-empty" hidden>No reset credits archived yet.</p>
-  </section>
-</div>
-
-<div class="empty" id="empty" hidden>
-  No closed windows archived yet — run <code>pool.py backfill-history</code>.
 </div>
 
 <script>
 const ROWS = /*__DATA__*/[];
 
 const COUPONS = /*__COUPONS__*/[];
-const COUPON_STATES = ["available", "redeemed", "expired_unused", "gone"];
+const ACCOUNTS = /*__ACCOUNTS__*/[];
+const BANKED = /*__BANKED__*/[];
+const RESET_POSTS = /*__RESET_POSTS__*/[];
+const RESET_NOTES = /*__RESET_NOTES__*/[];
+const COUPON_STATES = ["available", "redeemed", "expired", "gone"];
 const couponVar = s => "var(" + (COUPON_STATES.includes(s) ? "--coupon-" + s : "--coupon-gone") + ")";
 const SVGNS = "http://www.w3.org/2000/svg";
 const PROV = ["codex", "claude", "xai", "antigravity", "copilot", "devin"];
@@ -284,6 +398,84 @@ function barPath(x, y, w, h, r) {
          " L" + (x + w) + "," + (y + h) + " Z";
 }
 function pct(v) { return (v == null ? 0 : Number(v)).toFixed(1); }
+function utcStamp(raw) {
+  if (raw == null || raw === "") return "";
+  let date;
+  if (typeof raw === "number") {
+    date = new Date(raw * 1000);
+  } else {
+    let value = String(raw);
+    if (/^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}(:\\d{2})?$/.test(value)) {
+      value = value.replace(" ", "T") + (value.length === 16 ? ":00Z" : "Z");
+    }
+    date = new Date(value);
+  }
+  if (Number.isNaN(date.getTime())) return String(raw);
+  return date.toISOString().replace("T", " ").slice(0, 19);
+}
+
+const tableSorts = {};
+function renderDataTable(id, rows, columns, defaultSort) {
+  const table = document.getElementById(id);
+  if (!table) return;
+  if (!tableSorts[id]) tableSorts[id] = { ...defaultSort };
+  const state = tableSorts[id];
+  table.textContent = "";
+
+  const thead = document.createElement("thead");
+  const htr = document.createElement("tr");
+  for (const col of columns) {
+    const th = document.createElement("th");
+    th.textContent = col.label + " ";
+    if (col.num) th.style.textAlign = "right";
+    if (state.key === col.key) {
+      const arrow = document.createElement("span");
+      arrow.className = "arrow";
+      arrow.textContent = state.dir > 0 ? "\\u25B2" : "\\u25BC";
+      th.appendChild(arrow);
+    }
+    th.addEventListener("click", () => {
+      if (state.key === col.key) state.dir *= -1;
+      else { state.key = col.key; state.dir = 1; }
+      renderDataTable(id, rows, columns, defaultSort);
+    });
+    htr.appendChild(th);
+  }
+  thead.appendChild(htr);
+  table.appendChild(thead);
+
+  const sorted = rows.slice().sort((a, b) => {
+    let x = a[state.key], y = b[state.key];
+    if (x == null) x = ""; if (y == null) y = "";
+    if (typeof x === "number" && typeof y === "number") return (x - y) * state.dir;
+    return String(x).localeCompare(String(y)) * state.dir;
+  });
+  const tbody = document.createElement("tbody");
+  for (const row of sorted) {
+    const tr = document.createElement("tr");
+    for (const col of columns) {
+      const td = document.createElement("td");
+      if (col.num) td.classList.add("num");
+      if (col.wrap) td.classList.add("wrap");
+      if (col.source) {
+        td.classList.add("source");
+        const link = document.createElement("a");
+        link.href = row[col.key];
+        link.target = "_blank";
+        link.rel = "noreferrer";
+        link.textContent = "open";
+        link.setAttribute("aria-label", "Open original source");
+        td.appendChild(link);
+      } else {
+        const value = col.display ? col.display(row) : row[col.key];
+        td.textContent = value == null ? "" : String(value);
+      }
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+}
 
 // ---- filters ------------------------------------------------------------
 function uniq(key) {
@@ -494,6 +686,56 @@ function renderTable(rows) {
   table.appendChild(tbody);
 }
 
+// ---- account and public reset archive -----------------------------------
+const ACCOUNT_COLS = [
+  { key: "account_id", label: "#", num: true },
+  { key: "email", label: "Email" },
+  { key: "plan", label: "Plan" },
+  { key: "paid_since", label: "Paid since (UTC)", display: r => utcStamp(r.paid_since) },
+  { key: "renews_at", label: "Renews (UTC)", display: r => utcStamp(r.renews_at) },
+  { key: "auto_renew", label: "Auto-renew" },
+  { key: "account_created_at", label: "Account created (UTC)",
+    display: r => utcStamp(r.account_created_at) },
+];
+const ANNOUNCEMENT_COLS = [
+  { key: "number", label: "#", num: true },
+  { key: "posted_at_utc", label: "Issued at (UTC)" },
+  { key: "kind", label: "Type" },
+  { key: "audience", label: "Audience" },
+  { key: "summary", label: "Reason and details", wrap: true },
+  { key: "source_url", label: "Source", source: true },
+];
+const RESET_POST_COLS = [
+  { key: "number", label: "#", num: true },
+  { key: "posted_at_utc", label: "Posted at (UTC)" },
+  { key: "kind", label: "Type" },
+  { key: "audience", label: "Audience" },
+  { key: "summary", label: "Announcement and cause", wrap: true },
+  { key: "source_url", label: "Source", source: true },
+];
+const NOTE_COLS = [
+  { key: "topic", label: "Topic" },
+  { key: "detail", label: "What the evidence supports", wrap: true },
+];
+
+function renderArchiveTables() {
+  const accountCard = document.getElementById("account-card");
+  accountCard.hidden = !ACCOUNTS.length;
+  if (ACCOUNTS.length) {
+    renderDataTable("account-table", ACCOUNTS, ACCOUNT_COLS,
+      { key: "account_id", dir: 1 });
+  }
+  renderDataTable("banked-table", BANKED, ANNOUNCEMENT_COLS,
+    { key: "posted_at_utc", dir: -1 });
+  renderDataTable("reset-post-table", RESET_POSTS, RESET_POST_COLS,
+    { key: "posted_at_utc", dir: -1 });
+  renderDataTable("reset-note-table", RESET_NOTES, NOTE_COLS,
+    { key: "topic", dir: 1 });
+  document.getElementById("reset-post-summary").textContent =
+    RESET_POSTS.length + " source-linked posts through " +
+    (RESET_POSTS.length ? RESET_POSTS[RESET_POSTS.length - 1].posted_at_utc : "n/a") + " UTC.";
+}
+
 // ---- coupon ledger ------------------------------------------------------
 function couponBadge(state) {
   const b = document.createElement("span");
@@ -507,22 +749,18 @@ function couponBadge(state) {
   return b;
 }
 const COUPON_COLS = [
+  { key: "number", label: "#", num: true },
   { key: "account", label: "Account", num: false },
-  { key: "title", label: "Title", num: false },
-  { key: "granted_at", label: "Granted", num: false,
-    display: r => (r.granted_at || "").slice(0, 10) },
-  { key: "expires_at", label: "Expires", num: false,
-    display: r => (r.expires_at || "").slice(0, 10) },
-  { key: "first_seen_at", label: "First seen", num: false,
-    display: r => (r.first_seen_at || "").slice(5, 16) },
-  { key: "last_seen_at", label: "Last seen", num: false,
-    display: r => (r.last_seen_at || "").slice(5, 16) },
-  { key: "final_state", label: "Final state", num: false, badge: true },
-  { key: "redeemed_at", label: "Redeemed at", num: false,
-    display: r => (r.redeemed_at || "").slice(5, 16) },
-  { key: "description", label: "Reason", num: false },
+  { key: "plan", label: "Plan", num: false },
+  { key: "granted_at", label: "Granted at (UTC)", num: false,
+    display: r => utcStamp(r.granted_at) },
+  { key: "credit_type", label: "Type", num: false },
+  { key: "description", label: "Reason / invited", num: false, wrap: true },
+  { key: "expires_at", label: "Expires at (UTC)", num: false,
+    display: r => utcStamp(r.expires_at) },
+  { key: "status", label: "Status", num: false, badge: true },
 ];
-let couponSort = { key: "last_seen_at", dir: -1 };
+let couponSort = { key: "granted_at", dir: 1 };
 function renderCouponTable() {
   const card = document.getElementById("coupon-card");
   const table = document.getElementById("coupon-table");
@@ -533,7 +771,7 @@ function renderCouponTable() {
   }
   card.hidden = false; empty.hidden = true;
   const counts = {};
-  for (const r of COUPONS) counts[r.final_state] = (counts[r.final_state] || 0) + 1;
+  for (const r of COUPONS) counts[r.status] = (counts[r.status] || 0) + 1;
   summary.textContent = COUPON_STATES.filter(s => counts[s])
     .map(s => counts[s] + " " + s).join(" · ");
 
@@ -568,6 +806,7 @@ function renderCouponTable() {
     const tr = document.createElement("tr");
     for (const c of COUPON_COLS) {
       const td = document.createElement("td");
+      if (c.wrap) td.classList.add("wrap");
       if (c.badge) td.appendChild(couponBadge(r[c.key]));
       else td.textContent = c.display ? c.display(r) : (r[c.key] == null ? "" : String(r[c.key]));
       tr.appendChild(td);
@@ -586,19 +825,16 @@ function render() {
 }
 
 function init() {
-  if (!ROWS.length && !COUPONS.length) {
-    document.getElementById("app").hidden = true;
-    document.getElementById("empty").hidden = false;
-    return;
-  }
-  document.getElementById("empty").hidden = true;
+  renderArchiveTables();
   if (ROWS.length) {
     fillSelect("f-provider", uniq("provider"), "All providers");
     fillSelect("f-account", uniq("account"), "All accounts");
     fillSelect("f-kind", uniq("window_kind"), "All windows");
     render();
   } else {
-    document.getElementById("chart-empty").hidden = true;
+    document.getElementById("window-filters").hidden = true;
+    document.getElementById("window-chart-card").hidden = true;
+    document.getElementById("window-table-card").hidden = true;
   }
   renderCouponTable();
   let t;

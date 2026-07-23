@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>token-bar accounts</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36; --text: #e7ebf2;
+    --muted: #8b93a4; --accent: #4f8cff; --ok: #35c07a; --warn: #e2b447; --err: #e5604d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 24px; border-bottom: 1px solid var(--line); position: sticky; top: 0;
+    background: var(--bg); z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  main { max-width: 900px; margin: 0 auto; padding: 24px; }
+  .add-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+  button {
+    font: inherit; color: var(--text); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 7px; padding: 8px 14px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger:hover { border-color: var(--err); color: var(--err); }
+  button:disabled { opacity: .5; cursor: default; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 10px; display: flex; align-items: center; gap: 14px;
+  }
+  .card .badge {
+    width: 40px; height: 40px; border-radius: 8px; display: grid; place-items: center;
+    background: #10131a; font-weight: 600; text-transform: uppercase; font-size: 12px; color: var(--muted);
+  }
+  .card .meta { flex: 1; min-width: 0; }
+  .card .meta .name { font-weight: 600; }
+  .card .meta .line2 { color: var(--muted); font-size: 12px; }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); }
+  .pill.ok { color: var(--ok); border-color: #24503b; }
+  .pill.warn { color: var(--warn); border-color: #4d431f; }
+  .pill.err { color: var(--err); border-color: #4d2b24; }
+  .card .actions { display: flex; gap: 6px; }
+  .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+  dialog {
+    background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 12px; padding: 22px; width: 420px; max-width: 92vw;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  dialog h2 { margin: 0 0 6px; font-size: 15px; }
+  dialog p { color: var(--muted); margin: 0 0 14px; font-size: 13px; }
+  dialog .spin {
+    width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--line);
+    border-top-color: var(--accent); display: inline-block; animation: spin 1s linear infinite;
+    vertical-align: -3px; margin-right: 8px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  dialog textarea {
+    width: 100%; background: #10131a; color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 8px; font: 12px/1.4 ui-monospace, monospace; resize: vertical;
+  }
+  dialog .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+  .manual-toggle { color: var(--accent); cursor: pointer; font-size: 12px; }
+  .err-text { color: var(--err); font-size: 12px; margin-top: 8px; min-height: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>token-bar accounts</h1>
+    <div class="sub" id="subline">loading…</div>
+  </div>
+  <button id="refresh">Refresh</button>
+</header>
+<main>
+  <div class="add-row" id="add-row"></div>
+  <div id="accounts"></div>
+</main>
+
+<dialog id="login-dialog">
+  <h2 id="login-title">Connecting…</h2>
+  <p id="login-body"><span class="spin"></span>Complete the login in the browser tab that just opened.</p>
+  <div class="manual-toggle" id="manual-toggle">Can't reach the browser? Paste the redirect URL</div>
+  <div id="manual-area" style="display:none; margin-top:10px;">
+    <textarea id="manual-input" rows="3" placeholder="Paste the full redirect URL or code#state"></textarea>
+  </div>
+  <div class="err-text" id="login-err"></div>
+  <div class="row">
+    <button id="manual-submit" style="display:none;">Submit code</button>
+    <button id="login-cancel" class="danger">Cancel</button>
+  </div>
+</dialog>
+
+<script>
+const PROVIDERS = [
+  ["codex", "Codex"], ["claude", "Claude"], ["xai", "Grok"],
+  ["antigravity", "Antigravity"],
+];
+let browserProviders = new Set(PROVIDERS.map(p => p[0]));
+let pollTimer = null, statusPoll = null, activeProvider = null;
+
+function api(path, opts) {
+  return fetch(path, Object.assign({ headers: { "Content-Type": "application/json" } }, opts))
+    .then(async r => { const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j; });
+}
+
+function statusClass(s) {
+  const st = (s && s.quota) || "";
+  if (st === "exhausted") return "err";
+  if (st === "warning") return "warn";
+  return "ok";
+}
+
+function accountRow(a) {
+  const el = document.createElement("div");
+  el.className = "card";
+  const badge = (a.provider || "?").slice(0, 3);
+  const used = a.primary_used_pct != null ? ` · ${Number(a.primary_used_pct).toFixed(0)}% used` : "";
+  const plan = a.plan ? ` · ${a.plan}` : "";
+  const expired = a.token_expired ? '<span class="pill err">token expired</span>' : "";
+  const sc = statusClass(a.state);
+  el.innerHTML = `
+    <div class="badge">${badge}</div>
+    <div class="meta">
+      <div class="name">${escapeHtml(a.label || a.email || ("#" + a.id))}</div>
+      <div class="line2">${escapeHtml(a.email || "")}${plan}${used}</div>
+    </div>
+    <span class="pill ${sc}">${escapeHtml((a.state && a.state.quota) || a.status || "unknown")}</span>
+    ${expired}
+    <div class="actions"></div>`;
+  const actions = el.querySelector(".actions");
+  if (browserProviders.has(a.provider)) {
+    actions.appendChild(mkBtn("Reconnect", () => startLogin(a.provider, { account_id: a.id })));
+  }
+  if (a.provider === "codex" || a.provider === "claude") {
+    actions.appendChild(mkBtn("Swap in", () => act("/api/oauth/swap", { account_id: a.id })));
+  }
+  const rm = mkBtn("Remove", () => { if (confirm("Remove this account?")) act("/api/oauth/logout", { account_id: a.id }); });
+  rm.className = "danger";
+  actions.appendChild(rm);
+  return el;
+}
+
+function mkBtn(label, fn) { const b = document.createElement("button"); b.textContent = label; b.onclick = fn; return b; }
+function escapeHtml(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+function act(path, body) {
+  return api(path, { method: "POST", body: JSON.stringify(body) }).then(load).catch(e => alert(e.message));
+}
+
+function renderAddRow() {
+  const row = document.getElementById("add-row");
+  row.innerHTML = "";
+  for (const [id, name] of PROVIDERS) {
+    if (!browserProviders.has(id)) continue;
+    const b = mkBtn("+ " + name, () => startLogin(id, {}));
+    b.className = "primary";
+    row.appendChild(b);
+  }
+}
+
+function load() {
+  return api("/api/status").then(data => {
+    const acc = document.getElementById("accounts");
+    acc.innerHTML = "";
+    const list = data.accounts || [];
+    if (!list.length) {
+      acc.innerHTML = '<div class="empty">No accounts yet. Add one above.</div>';
+    } else {
+      for (const a of list) acc.appendChild(accountRow(a));
+    }
+    document.getElementById("subline").textContent =
+      `${list.length} account${list.length === 1 ? "" : "s"} · updated ${new Date().toLocaleTimeString()}`;
+  }).catch(e => { document.getElementById("subline").textContent = "error: " + e.message; });
+}
+
+// ── login flow ─────────────────────────────────────────────────────────────
+const dlg = document.getElementById("login-dialog");
+function startLogin(provider, extra) {
+  activeProvider = provider;
+  document.getElementById("login-title").textContent = "Connecting " + provider + "…";
+  document.getElementById("login-body").innerHTML = '<span class="spin"></span>Complete the login in the browser tab that just opened.';
+  document.getElementById("login-err").textContent = "";
+  document.getElementById("manual-area").style.display = "none";
+  document.getElementById("manual-submit").style.display = "none";
+  dlg.showModal();
+  api("/api/oauth/login", { method: "POST", body: JSON.stringify(Object.assign({ provider }, extra)) })
+    .then(() => pollStatus(provider))
+    .catch(e => { document.getElementById("login-err").textContent = e.message; });
+}
+
+function pollStatus(provider) {
+  clearInterval(statusPoll);
+  statusPoll = setInterval(() => {
+    api("/api/oauth/status?provider=" + encodeURIComponent(provider)).then(s => {
+      if (s.status === "complete") {
+        clearInterval(statusPoll);
+        document.getElementById("login-title").textContent = "Connected";
+        document.getElementById("login-body").textContent = "✓ " + (s.email || provider) + (s.plan ? " (" + s.plan + ")" : "");
+        setTimeout(() => { dlg.close(); load(); }, 900);
+      } else if (s.status === "error") {
+        clearInterval(statusPoll);
+        document.getElementById("login-body").textContent = "Login failed.";
+        document.getElementById("login-err").textContent = s.error || "unknown error";
+      } else if (s.status === "cancelled" || s.status === "idle") {
+        clearInterval(statusPoll);
+      }
+    }).catch(() => {});
+  }, 1000);
+}
+
+document.getElementById("login-cancel").onclick = () => {
+  clearInterval(statusPoll);
+  if (activeProvider) api("/api/oauth/login/cancel", { method: "POST", body: JSON.stringify({ provider: activeProvider }) }).catch(() => {});
+  dlg.close();
+};
+document.getElementById("manual-toggle").onclick = () => {
+  document.getElementById("manual-area").style.display = "block";
+  document.getElementById("manual-submit").style.display = "inline-block";
+};
+document.getElementById("manual-submit").onclick = () => {
+  const input = document.getElementById("manual-input").value.trim();
+  if (!input || !activeProvider) return;
+  api("/api/oauth/login/code", { method: "POST", body: JSON.stringify({ provider: activeProvider, input }) })
+    .catch(e => { document.getElementById("login-err").textContent = e.message; });
+};
+
+document.getElementById("refresh").onclick = load;
+
+api("/api/oauth/providers").then(j => {
+  if (j.providers && j.providers.length) browserProviders = new Set(j.providers);
+}).finally(() => { renderAddRow(); load(); });
+// Light live refresh so swaps / poll updates show without a manual reload.
+pollTimer = setInterval(load, 15000);
+</script>
+</body>
+</html>
